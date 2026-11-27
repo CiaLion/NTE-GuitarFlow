@@ -102,21 +102,27 @@ class GameIO(object):
         ie.tap_key(key, hold)
 
     def tap_key_down(self, key):
-        """**只按下**翻页键（T/R），不 sleep。
+        """**只按下**按键（翻页或 36 键），不 sleep。
 
-        高精度时间轴（timeline_runner）用：翻页键的"按住多久"由时间轴里另一条
+        高精度时间轴（timeline_runner）用：按键的"按住多久"由时间轴里另一条
         松开动作负责，执行器本身不能在这里睡觉，否则后面全串味。
         返回 True/False（键名不认识返回 False）。
         """
-        sc = ie.SCANCODES.get(str(key).upper())
+        k = str(key)
+        sc = ie.SCANCODES.get(k)
+        if sc is None:
+            sc = ie.SCANCODES.get(k.upper())
         if sc is None:
             return False
         ie.press_scancode(sc)
         return True
 
     def tap_key_up(self, key):
-        """**只松开**翻页键（T/R），与 `tap_key_down` 配套。"""
-        sc = ie.SCANCODES.get(str(key).upper())
+        """**只松开**按键，与 `tap_key_down` 配套。"""
+        k = str(key)
+        sc = ie.SCANCODES.get(k)
+        if sc is None:
+            sc = ie.SCANCODES.get(k.upper())
         if sc is None:
             return False
         ie.release_scancode(sc)
@@ -128,15 +134,15 @@ class GameIO(object):
         hold = 按住多久。**长按会延音**（实测：最长约 4 秒、带渐弱），
         所以长音就靠这里按住不放 —— 见 `Performer.pluck(..., hold=…)`。
         """
-        return ie.tap_number_key(int(string), float(hold))
+        return ie.tap_number_key(str(string), float(hold))
 
     def pluck_key_down(self, string):
-        """只按下数字键（长按延音的开始）。"""
-        return ie.number_key_down(int(string))
+        """只按下数字键（长按延音的开始，支持 '0'..'9'）。"""
+        return ie.number_key_down(str(string))
 
     def pluck_key_up(self, string):
-        """松开数字键（结束延音）。"""
-        return ie.number_key_up(int(string))
+        """松开数字键（结束延音，支持 '0'..'9'）。"""
+        return ie.number_key_up(str(string))
 
     def is_key_down(self, vk):
         return ie.is_key_down(vk)
@@ -194,22 +200,37 @@ class GameIO(object):
             user32.ClientToScreen(hwnd, ctypes.byref(pt))
             hdesk = user32.GetDesktopWindow()
             hdc = user32.GetDC(hdesk)
-            memdc = gdi32.CreateCompatibleDC(hdc)
-            bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
-            gdi32.SelectObject(memdc, bmp)
-            gdi32.BitBlt(memdc, 0, 0, w, h, hdc, pt.x, pt.y, 0x00CC0020)
-            bi = BMIH()
-            bi.biSize = ctypes.sizeof(BMIH)
-            bi.biWidth = w
-            bi.biHeight = -h
-            bi.biPlanes = 1
-            bi.biBitCount = 32
-            buf = ctypes.create_string_buffer(w * h * 4)
-            gdi32.GetDIBits(memdc, bmp, 0, h, buf, ctypes.byref(bi), 0)
-            gdi32.DeleteObject(bmp)
-            gdi32.DeleteDC(memdc)
-            user32.ReleaseDC(hdesk, hdc)
-            return Image.frombuffer("RGBA", (w, h), buf, "raw", "BGRA", 0, 1).convert("RGB")
+            if not hdc:
+                return None
+            memdc = None
+            bmp = None
+            old_bmp = None
+            try:
+                memdc = gdi32.CreateCompatibleDC(hdc)
+                if not memdc:
+                    return None
+                bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
+                if not bmp:
+                    return None
+                old_bmp = gdi32.SelectObject(memdc, bmp)
+                gdi32.BitBlt(memdc, 0, 0, w, h, hdc, pt.x, pt.y, 0x00CC0020)
+                bi = BMIH()
+                bi.biSize = ctypes.sizeof(BMIH)
+                bi.biWidth = w
+                bi.biHeight = -h
+                bi.biPlanes = 1
+                bi.biBitCount = 32
+                buf = ctypes.create_string_buffer(w * h * 4)
+                gdi32.GetDIBits(memdc, bmp, 0, h, buf, ctypes.byref(bi), 0)
+                return Image.frombuffer("RGBA", (w, h), buf, "raw", "BGRA", 0, 1).convert("RGB")
+            finally:
+                if memdc and old_bmp:
+                    gdi32.SelectObject(memdc, old_bmp)
+                if bmp:
+                    gdi32.DeleteObject(bmp)
+                if memdc:
+                    gdi32.DeleteDC(memdc)
+                user32.ReleaseDC(hdesk, hdc)
         except Exception:
             return None
 

@@ -17,7 +17,13 @@ import json
 import os
 import sys
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.insert(0, _SELF_DIR)
+
+from core_utils import ROOT as _CORE_ROOT, get_logger, sha256_file  # noqa: E402
+
+ROOT = str(_CORE_ROOT)
 VERSION_FILE = os.path.join(ROOT, "version.json")
 
 # 受管文件：这些更新时会跟着远端清单一起替换
@@ -26,6 +32,7 @@ MANAGED_PATTERNS = (
     "player/*.py",
     "transcriber/*.py",
     "setup/*.ps1",
+    "assets/ui/*.jpg",
     "vendor/sheetsage2/transcribe_cli.py",
     "vendor/sheetsage2/requirements-base.txt",
     "vendor/sheetsage2/requirements-sep.txt",
@@ -39,11 +46,6 @@ EXCLUDE = {
     "verify_release.py",
     "_verify_7f.py",
 }
-
-
-def sha256_file(path):
-    with open(path, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()
 
 
 def collect_files(root=ROOT):
@@ -65,7 +67,8 @@ def load_current():
         with open(VERSION_FILE, "r", encoding="utf-8-sig") as f:
             man = json.load(f)
         return man if isinstance(man, dict) else {}
-    except Exception:
+    except Exception as exc:
+        get_logger("update_manifest").debug("load_current failed: %s", exc)
         return {}
 
 

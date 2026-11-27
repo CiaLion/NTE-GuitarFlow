@@ -26,23 +26,29 @@ def make_dpi_aware():
 
 # Hardware scancodes accepted by Unreal Engine
 SCANCODES = {
-    # Number row (High Octave in Piano Mode / Strings 1-6 in Guitar Mode)
+    # Number row (High Octave in Guitar 36 Mode / Strings 1-6 in Guitar Mode)
     '1': 0x02, '2': 0x03, '3': 0x04, '4': 0x05, '5': 0x06,
     '6': 0x07, '7': 0x08, '8': 0x09, '9': 0x0A, '0': 0x0B,
     '-': 0x0C, '=': 0x0D,
-    
-    # QWERTY row (Mid Octave in Piano Mode / Page R & T in Guitar Mode)
+
+    # QWERTY row (High Octave in Piano Mode / Mid Octave in Guitar 36 Mode / Page R & T in Guitar Mode)
     'Q': 0x10, 'W': 0x11, 'E': 0x12, 'R': 0x13, 'T': 0x14,
     'Y': 0x15, 'U': 0x16, 'I': 0x17, 'O': 0x18, 'P': 0x19,
     '[': 0x1A, ']': 0x1B,
-    
-    # ASDF row (Low Octave in Piano Mode)
+
+    # ASDF row (Mid Octave in Piano Mode / Low Octave in Guitar 36 Mode)
     'A': 0x1E, 'S': 0x1F, 'D': 0x20, 'F': 0x21, 'G': 0x22,
     'H': 0x23, 'J': 0x24, 'K': 0x25, 'L': 0x26, ';': 0x27,
-    "'": 0x28, 'Enter': 0x1C,
-    
-    # Function keys & Controls
-    'Z': 0x2C, 'V': 0x2F, 'Space': 0x39, 'Esc': 0x01
+    "'": 0x28, 'Enter': 0x1C, 'ENTER': 0x1C,
+
+    # ZXCV row (Low Octave in Piano Mode)
+    'Z': 0x2C, 'X': 0x2D, 'C': 0x2E, 'V': 0x2F, 'B': 0x30,
+    'N': 0x31, 'M': 0x32,
+
+    # Modifiers & Controls
+    'LShift': 0x2A, 'LSHIFT': 0x2A, 'SHIFT': 0x2A,
+    'LCtrl': 0x1D, 'LCTRL': 0x1D, 'CTRL': 0x1D,
+    'Space': 0x39, 'Esc': 0x01,
 }
 
 class KEYBDINPUT(ctypes.Structure):
@@ -114,7 +120,9 @@ def _send_key(scancode, up):
     temporary Python object that was already freed by the time Windows read it,
     which is undefined behaviour and can make a title/anti-cheat drop the key.
     """
-    vk = user32.MapVirtualKeyW(scancode, 1)  # MAPVK_VSC_TO_VK
+    vk = user32.MapVirtualKeyW(scancode, 3)  # MAPVK_VSC_TO_VK_EX
+    if not vk:
+        vk = user32.MapVirtualKeyW(scancode, 1)  # MAPVK_VSC_TO_VK
     inp = INPUT()
     inp.type = INPUT_KEYBOARD
     inp.union.ki.wVk = vk
@@ -143,7 +151,7 @@ def tap_key(key_str, duration=0.05):
 # Page turns (R/T) work through the scan-code path, but the string plucks (1-6)
 # do not, even though pressing those keys by hand works. So plucking uses this
 # path instead.
-VK_NUMBERS = {str(d): 0x30 + d for d in range(1, 10)}       # '1'..'9'
+VK_NUMBERS = {str(d): 0x30 + d for d in range(0, 10)}       # '0'..'9'
 VK_ZERO = 0x30
 
 def _send_vk(vk, up):
@@ -234,51 +242,77 @@ def mouse_click(button='left', duration=0.03):
 class POINT(ctypes.Structure):
     _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
 
+_LAST_GAME_HWND = None
+
+
+def _is_game_window(hwnd):
+    """Verify hwnd is a visible UnrealWindow belonging to 异环 (HTGame/NTE/Neverness)."""
+    if not hwnd or not user32.IsWindow(hwnd) or not user32.IsWindowVisible(hwnd):
+        return False
+    cls_buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, cls_buf, 256)
+    if cls_buf.value != "UnrealWindow":
+        return False
+
+    buf = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, buf, 512)
+    title = buf.value
+
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    hProc = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if hProc:
+        try:
+            path_buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            ok = kernel32.QueryFullProcessImageNameW(hProc, 0, path_buf, ctypes.byref(size))
+            proc_path = path_buf.value if ok else ""
+        finally:
+            kernel32.CloseHandle(hProc)
+        return (any(kw in proc_path for kw in ("HTGame", "NTE", "Neverness"))
+                or any(kw in title for kw in ("异环", "NTE", "Neverness")))
+    return any(kw in title for kw in ("异环", "NTE", "Neverness"))
+
+
 def find_game_window():
-    """Find the 异环 (HTGame.exe) game window handle."""
+    """Find the 异环 (HTGame.exe) game window handle without leaking desktop handles."""
+    global _LAST_GAME_HWND
+    if _LAST_GAME_HWND and _is_game_window(_LAST_GAME_HWND):
+        return _LAST_GAME_HWND
+    _LAST_GAME_HWND = None
+
     found_hwnd = None
-    
-    hdesk = user32.OpenInputDesktop(0, False, 0x01ff)
-    if hdesk:
-        user32.SetThreadDesktop(hdesk)
-        
     CMPFUNC = ctypes.WINFUNCTYPE(ctypes.c_int, wintypes.HWND, wintypes.LPARAM)
-    
+
     def enum_proc(hwnd, lParam):
         nonlocal found_hwnd
-        if not user32.IsWindowVisible(hwnd):
-            return 1
-            
-        cls_buf = ctypes.create_unicode_buffer(256)
-        user32.GetClassNameW(hwnd, cls_buf, 256)
-        cls_name = cls_buf.value
-        
-        # Unreal Engine game window
-        if cls_name == "UnrealWindow":
-            buf = ctypes.create_unicode_buffer(512)
-            user32.GetWindowTextW(hwnd, buf, 512)
-            title = buf.value
-            
-            # Check process name to be certain it's HTGame.exe
-            pid = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            hProc = kernel32.OpenProcess(0x1000, False, pid.value) # PROCESS_QUERY_LIMITED_INFORMATION
-            if hProc:
-                path_buf = ctypes.create_unicode_buffer(1024)
-                size = wintypes.DWORD(1024)
-                kernel32.QueryFullProcessImageNameW(hProc, 0, path_buf, ctypes.byref(size))
-                kernel32.CloseHandle(hProc)
-                proc_path = path_buf.value 
-                if any(kw in proc_path for kw in ("HTGame", "NTE", "Neverness")) or \
-                   any(kw in title for kw in ("异环", "NTE", "Neverness")):
-                    found_hwnd = hwnd
-                    return 0
-            elif any(kw in title for kw in ("异环", "NTE", "Neverness")):
-                found_hwnd = hwnd
-                return 0
+        if _is_game_window(hwnd):
+            found_hwnd = hwnd
+            return 0
         return 1
 
-    user32.EnumDesktopWindows(hdesk if hdesk else 0, CMPFUNC(enum_proc), 0)
+    cb = CMPFUNC(enum_proc)
+    user32.EnumWindows(cb, 0)
+    if found_hwnd:
+        _LAST_GAME_HWND = found_hwnd
+        return found_hwnd
+
+    # Fallback only when EnumWindows found nothing: safely open & close input desktop
+    tid = kernel32.GetCurrentThreadId()
+    prev_desk = user32.GetThreadDesktop(tid)
+    hdesk = user32.OpenInputDesktop(0, False, 0x0001)  # DESKTOP_READOBJECTS
+    if hdesk:
+        switched = False
+        try:
+            switched = bool(user32.SetThreadDesktop(hdesk))
+            user32.EnumDesktopWindows(hdesk, cb, 0)
+        finally:
+            if switched and prev_desk:
+                user32.SetThreadDesktop(prev_desk)
+            user32.CloseDesktop(hdesk)
+
+    if found_hwnd:
+        _LAST_GAME_HWND = found_hwnd
     return found_hwnd
 
 def get_window_metrics(hwnd):
@@ -309,7 +343,9 @@ def focus_game_window(hwnd):
     
     # Bypass Windows LockSetForegroundWindow restriction
     user32.keybd_event(0x12, 0, 0, 0) # Alt down
-    user32.SetForegroundWindow(hwnd)
-    user32.keybd_event(0x12, 0, 2, 0) # Alt up
+    try:
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        user32.keybd_event(0x12, 0, 2, 0) # Alt up
     time.sleep(0.15)
     return True

@@ -1211,8 +1211,11 @@ def run_sep_model(audio: Union[str, Path], temp_dir: Union[str, Path],
                   log=None, timeout: float = 3600.0) -> Dict[str, Path]:
     """调用 vendor 环境里的原生分离器，产出人声/乐器两条 WAV。"""
     runner = sep_runner_path()
-    venv_py = (Path(__file__).resolve().parent.parent / "vendor" / "sheetsage2"
-               / ".venv" / "Scripts" / "python.exe")
+    venv_py = (
+        SHEETSAGE2_PY if SHEETSAGE2_PY.is_file()
+        else (Path(__file__).resolve().parent.parent / "vendor" / "sheetsage2"
+              / ".venv" / "Scripts" / "python.exe")
+    )
     if not runner.is_file() or not venv_py.is_file():
         raise RuntimeError("未找到原生分离器或推理环境")
     temp_dir = Path(temp_dir)
@@ -1298,8 +1301,6 @@ def run_all(
                 stems_paths = run_sep_model(audio, temp_sep, base, sep_model, log=print)
                 input_audio = stems_paths["vocal" if stems == "vocal" else "inst"]
             except Exception as exc:
-                if log:
-                    log("音源分离失败，回落内置双轨直出：%s" % exc)
                 print("音源分离失败，回落内置双轨直出：%s" % exc)
                 sep_model = "native"
 

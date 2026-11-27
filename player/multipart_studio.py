@@ -20,18 +20,67 @@ for _p in (ROOT, BASE, os.path.join(ROOT, "transcriber")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from PyQt5.QtCore import QPoint, QTimer, Qt, pyqtSignal  # noqa: E402
+from PyQt5.QtCore import QPoint, QSize, QTimer, Qt, pyqtSignal  # noqa: E402
 from PyQt5.QtGui import QColor, QKeySequence, QPainter, QPen, QPolygon  # noqa: E402
 from PyQt5.QtWidgets import (QApplication, QComboBox, QDialog,  # noqa: E402
                              QDoubleSpinBox,
                              QFileDialog, QFrame, QHBoxLayout, QInputDialog,
                              QLabel, QLineEdit, QListWidget, QListWidgetItem,
                              QMessageBox, QPushButton, QScrollBar, QShortcut,
-                             QSlider, QTabWidget, QVBoxLayout, QWidget)
+                             QSizePolicy, QSlider, QTabWidget, QVBoxLayout,
+                             QWidget)
 
 import convert as CV  # noqa: E402
 import midi_compiler as MC  # noqa: E402
 import player_config as PC  # noqa: E402
+try:
+    from core_utils import get_logger as _get_logger  # noqa: E402
+except Exception:  # noqa: BLE001
+    _get_logger = None
+try:
+    from ui_widgets import GlassCard as _GlassCard  # noqa: E402
+    from ui_widgets import make_vector_icon as _make_vector_icon  # noqa: E402
+except Exception:  # noqa: BLE001
+    _GlassCard = None
+    _make_vector_icon = None
+
+
+def _log_exc(ctx, exc):
+    if _get_logger is not None:
+        try:
+            _get_logger("multipart_studio").debug("%s: %s", ctx, exc)
+        except Exception:
+            pass
+
+
+def _make_card(parent=None):
+    if _GlassCard is not None:
+        return _GlassCard(parent)
+    frame = QFrame(parent)
+    frame.setObjectName("card")
+    return frame
+
+
+def _icon_color():
+    try:
+        app = QApplication.instance()
+        if app is not None:
+            from PyQt5.QtGui import QPalette
+            if app.palette().color(QPalette.Window).lightness() >= 128:
+                return "#1E293B"
+    except Exception:
+        pass
+    return "#E6EDF7"
+
+
+def _set_btn_icon(btn, icon_name, color=None, size=15):
+    if _make_vector_icon is None or btn is None:
+        return
+    try:
+        btn.setIcon(_make_vector_icon(icon_name, color=color or _icon_color(), size=size))
+        btn.setIconSize(QSize(size, size))
+    except Exception as exc:  # noqa: BLE001
+        _log_exc("set_btn_icon(%s)" % icon_name, exc)
 
 OUT_DIR = os.path.join(ROOT, "out")
 OPEN_PITCH = MC.OPEN_PITCH
@@ -138,10 +187,7 @@ def track_json_to_notes(js, default_bpm=120.0):
                     if n.get("tie") and prev is not None:
                         prev["dur"] = round(prev["dur"] + dur_beat * spb, 4)
                         continue
-                    while pitch < 40:
-                        pitch += 12
-                    while pitch > 88:
-                        pitch -= 12
+                    pitch = max(0, min(127, int(pitch)))
                     note = {"t": round(t0, 4),
                             "dur": max(0.05, dur_beat * spb * 0.95),
                             "pitch": pitch, "string": 6 - string,
@@ -155,11 +201,66 @@ def track_json_to_notes(js, default_bpm=120.0):
     return notes
 
 
+def _constraint_range(constraint_mode):
+    mode = str(constraint_mode or "guitar_fret")
+    if mode == "guitar_36":
+        return 52, 87
+    if mode == "piano_36":
+        return 60, 95
+    return 40, 88
+
+
 def sanitize_fret_frame(notes, frame_ms=15.0, constraint_mode="guitar_fret",
                         prev_fret=None):
-    """同帧内按品格可行性择优，剔除冲突音。"""
-    if constraint_mode != "guitar_fret" or not notes:
-        return list(notes), {"dropped": 0, "frames": 0}
+    """同帧清洗：吉他品格模式按同品格择优剔除冲突；36 键模式仅折叠音域并同帧同音高去重。"""
+    if not notes:
+        return [], {"dropped": 0, "frames": 0, "remapped": 0}
+    if constraint_mode in ("guitar_36", "piano_36"):
+        lo, hi = _constraint_range(constraint_mode)
+        folded = []
+        remapped = 0
+        for n in notes:
+            item = dict(n)
+            orig_p = int(item["pitch"])
+            p = orig_p
+            while p < lo:
+                p += 12
+            while p > hi:
+                p -= 12
+            if p != orig_p:
+                remapped += 1
+                item["pitch"] = p
+            folded.append(item)
+        folded.sort(key=lambda n: (float(n["t"]), -int(n["pitch"])))
+        kept, dropped, frames = [], 0, 0
+        cluster, cluster_t = [], None
+
+        def flush_kb(cl):
+            nonlocal dropped, frames
+            if not cl:
+                return
+            frames += 1
+            seen = set()
+            for item in cl:
+                p = int(item["pitch"])
+                if p in seen:
+                    dropped += 1
+                    continue
+                seen.add(p)
+                kept.append(item)
+
+        for item in folded:
+            t = float(item["t"]) * 1000.0
+            if cluster_t is None or abs(t - cluster_t) <= frame_ms:
+                cluster.append(item)
+                cluster_t = t if cluster_t is None else cluster_t
+                continue
+            flush_kb(cluster)
+            cluster, cluster_t = [item], t
+        flush_kb(cluster)
+        return kept, {"dropped": dropped, "frames": frames, "remapped": remapped}
+    if constraint_mode != "guitar_fret":
+        return list(notes), {"dropped": 0, "frames": 0, "remapped": 0}
     notes = sorted(notes, key=lambda n: (float(n["t"]), -int(n["pitch"])))
     kept, dropped, frames, remapped = [], 0, 0, 0
     cluster, cluster_t = [], None
@@ -275,8 +376,8 @@ def _read_bpm(path):
         for msg in mido.MidiFile(str(path)):
             if msg.type == "set_tempo":
                 return round(60_000_000 / msg.tempo, 3)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _log_exc("_read_bpm(%s)" % path, exc)
     return 120.0
 
 
@@ -285,37 +386,84 @@ def _safe_filename(name):
     return cleaned.strip(" ._") or "Track"
 
 
-def _fold_notes(notes):
+def _fold_notes(notes, low=40, high=88):
     out = []
     for n in notes or []:
         pitch = int(n["pitch"])
-        while pitch < 40:
+        while pitch < low:
             pitch += 12
-        while pitch > 88:
+        while pitch > high:
             pitch -= 12
         out.append(dict(n, pitch=pitch))
     return out
 
 
-def write_parts(song, parts, out_root=OUT_DIR, mix_parts=None):
+def _to_note_dicts(notes):
+    out = []
+    for n in notes or []:
+        if isinstance(n, dict):
+            out.append(dict(n))
+        else:
+            t0 = float(getattr(n, "start_sec", 0.0))
+            t1 = float(getattr(n, "end_sec", t0 + 0.05))
+            out.append({
+                "pitch": int(getattr(n, "pitch", 60)),
+                "t": t0,
+                "dur": max(0.05, t1 - t0),
+                "vel": int(getattr(n, "velocity", 80)),
+            })
+    return out
+
+
+def _to_cv_notes(notes):
+    out = []
+    for n in notes or []:
+        if isinstance(n, dict):
+            t0 = float(n["t"])
+            dur = max(0.05, float(n.get("dur") or 0.05))
+            out.append(CV.Note(pitch=int(n["pitch"]), start_sec=t0,
+                               end_sec=t0 + dur, velocity=int(n.get("vel", 80))))
+        else:
+            out.append(n)
+    return out
+
+
+def write_parts(song, parts, out_root=OUT_DIR, mix_parts=None,
+                constraint_mode="guitar_fret", sanitize=True):
     song = _safe_filename(song)
     folder = os.path.join(out_root, song)
     os.makedirs(folder, exist_ok=True)
+    lo, hi = _constraint_range(constraint_mode)
     made = []
     mix = []
+    text_ev = [(0, "SOLO_MODE:fret")] if constraint_mode == "guitar_fret" else []
     for i, (prefix, notes) in enumerate(parts):
         if not notes:
             continue
-        tracks = [CV.TrackNotes(_ascii_name(prefix, i), notes)]
+        if sanitize:
+            folded = _fold_notes(_to_note_dicts(notes), lo, hi)
+            kept, _st = sanitize_fret_frame(folded, constraint_mode=constraint_mode)
+            cv_notes = _to_cv_notes(kept)
+        else:
+            cv_notes = _to_cv_notes(notes)
+        if not cv_notes:
+            continue
+        tracks = [CV.TrackNotes(_ascii_name(prefix, i), cv_notes)]
         path = os.path.join(folder, _track_name(prefix, song) + ".mid")
-        CV.write_midi(path, tracks, text_events=[(0, "SOLO_MODE:fret")])
+        CV.write_midi(path, tracks, text_events=text_ev)
         made.append(path)
     for i, (prefix, notes) in enumerate(mix_parts if mix_parts is not None else parts):
-        if notes:
-            mix.append(CV.TrackNotes(_ascii_name(prefix, i), notes))
+        if not notes:
+            continue
+        if sanitize:
+            cv_notes = _to_cv_notes(_fold_notes(_to_note_dicts(notes), lo, hi))
+        else:
+            cv_notes = _to_cv_notes(notes)
+        if cv_notes:
+            mix.append(CV.TrackNotes(_ascii_name(prefix, i), cv_notes))
     if mix:
         path = os.path.join(folder, "全声部试听-%s.mid" % song)
-        CV.write_midi(path, mix, text_events=[(0, "SOLO_MODE:fret")])
+        CV.write_midi(path, mix, text_events=text_ev)
         made.append(path)
     return made
 
@@ -345,8 +493,8 @@ def _fit_dialog(widget, width, height, min_w=680, min_h=480):
         height = min(int(height), int(avail.height() * 0.90))
         min_w = min(int(min_w), int(avail.width() * 0.70))
         min_h = min(int(min_h), int(avail.height() * 0.65))
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _log_exc("_fit_dialog", exc)
     widget.resize(max(min_w, width), max(min_h, height))
     widget.setMinimumSize(min_w, min_h)
     return widget
@@ -441,21 +589,44 @@ class AlignCanvas(QWidget):
         super(AlignCanvas, self).resizeEvent(ev)
         self._sync_hbar()
 
+    @staticmethod
+    def _is_dark():
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                from PyQt5.QtGui import QPalette
+                return app.palette().color(QPalette.Window).lightness() < 128
+        except Exception:
+            pass
+        return True
+
     def paintEvent(self, _ev):
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor("#0f172a"))
+        dark = self._is_dark()
+        bg = QColor("#090C15") if dark else QColor("#F4F6FB")
+        ruler_bg = QColor("#111626") if dark else QColor("#FFFFFF")
+        ruler_bd = QColor("#232C47") if dark else QColor("#DCE3F2")
+        tick_col = QColor("#475569") if dark else QColor("#94A3B8")
+        txt_col = QColor("#CBD5E1") if dark else QColor("#334155")
+        grid_col = QColor("#232C47") if dark else QColor("#DCE3F2")
+        ref_col = QColor("#94A3B8") if dark else QColor("#64748B")
+        tgt_col = QColor("#3B6EF5") if dark else QColor("#2F5CE5")
+        ph_col = QColor("#F4C869") if dark else QColor("#D97706")
+        p.fillRect(self.rect(), bg)
         ruler = self.RULER_H
-        p.fillRect(0, 0, self.width(), ruler, QColor("#1e293b"))
+        p.fillRect(0, 0, self.width(), ruler, ruler_bg)
+        p.setPen(QPen(ruler_bd, 1))
+        p.drawLine(0, ruler - 1, self.width(), ruler - 1)
         t0, t1 = self.view_sec, self.view_sec + self.visible_sec()
         step = 1.0 if self.pps >= 40 else 5.0
-        p.setPen(QPen(QColor("#475569"), 1))
+        p.setPen(QPen(tick_col, 1))
         t = math.floor(t0 / step) * step
         while t <= t1:
             x = int((t - t0) * self.pps)
             if x >= 0:
                 p.drawLine(x, ruler - 6, x, ruler)
             t += step
-        p.setPen(QPen(QColor("#94a3b8"), 1))
+        p.setPen(QPen(txt_col, 1))
         font = p.font()
         font.setPointSize(7)
         p.setFont(font)
@@ -466,7 +637,7 @@ class AlignCanvas(QWidget):
                 p.drawText(x + 2, 10, "%gs" % round(t, 1))
             t += step
         beat = 60.0 / self.bpm
-        p.setPen(QPen(QColor("#334155"), 1, Qt.DotLine))
+        p.setPen(QPen(grid_col, 1, Qt.DotLine))
         t = math.floor(t0 / beat) * beat
         while t <= t1:
             x = int((t - t0) * self.pps)
@@ -475,15 +646,15 @@ class AlignCanvas(QWidget):
             t += beat
         band = max(1, (self.height() - ruler) // 2)
         mid = ruler + band
-        p.setPen(QPen(QColor("#334155"), 1))
+        p.setPen(QPen(grid_col, 1))
         p.drawLine(0, mid, self.width(), mid)
-        self._paint_band(p, self.ref, ruler, band, QColor("#94a3b8"), 0.0, 1.0)
-        self._paint_band(p, self.target, mid, band, QColor("#3b82f6"), self.offset, self.scale)
+        self._paint_band(p, self.ref, ruler, band, ref_col, 0.0, 1.0)
+        self._paint_band(p, self.target, mid, band, tgt_col, self.offset, self.scale)
         xh = int((self.playhead_sec - self.view_sec) * self.pps)
         if 0 <= xh <= self.width():
-            p.setPen(QPen(QColor("#facc15"), 2))
+            p.setPen(QPen(ph_col, 2))
             p.drawLine(xh, 0, xh, self.height())
-            p.setBrush(QColor("#facc15"))
+            p.setBrush(ph_col)
             p.drawPolygon(QPolygon([QPoint(xh - 5, 0), QPoint(xh + 5, 0), QPoint(xh, 8)]))
         p.end()
 
@@ -561,20 +732,43 @@ class MultipartStudioDialog(QDialog):
     sig_meta_done = pyqtSignal(object, int, str)
     sig_dl_progress = pyqtSignal(int, int, str)
 
-    def __init__(self, parent=None, on_done=None):
+    def __init__(self, parent=None, on_done=None, embedded=False, on_back=None):
         super(MultipartStudioDialog, self).__init__(parent)
+        self._embedded = bool(embedded)
+        self._on_back = on_back
         self.on_done = on_done
         self.setWindowTitle("乐曲库")
-        self.resize(1060, 720)
-        _fit_dialog(self, 1060, 720, 680, 480)
+        if self._embedded:
+            self.setWindowFlags(Qt.Widget)
+            self.setMinimumSize(0, 0)
+        else:
+            self.resize(1060, 720)
+            _fit_dialog(self, 1060, 720, 680, 480)
         self.song_name = ""
         self.song_notes = []
         self.tracks = []
         self._align_ref = []
         self._align_tgt = []
+        self._search_seq = 0
+        self._load_seq = 0
+        self._wav_path = None
+        self._closing = False
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setContentsMargins(10, 8, 10, 8)
+        if self._embedded:
+            top_bar = QHBoxLayout()
+            top_bar.setSpacing(8)
+            bar_title = QLabel("在线搜谱 · 多轨分轨 · 人声对齐工坊")
+            bar_title.setObjectName("sectionTitle")
+            top_bar.addWidget(bar_title, 1)
+            self.btn_back = QPushButton("← 返回演奏工作台")
+            self.btn_back.setObjectName("ghost")
+            self.btn_back.setMinimumHeight(30)
+            self.btn_back.clicked.connect(self._handle_back)
+            top_bar.addWidget(self.btn_back)
+            lay.addLayout(top_bar)
         self.tabs = QTabWidget()
+        self.tabs.setMinimumWidth(0)
         lay.addWidget(self.tabs, 1)
         self.tabs.addTab(self._build_import_tab(), "乐谱导入")
         self.tabs.addTab(self._build_align_tab(), "人声对齐")
@@ -582,6 +776,10 @@ class MultipartStudioDialog(QDialog):
         self.sig_search_done.connect(self._on_search_done)
         self.sig_meta_done.connect(self._on_meta_done)
         self.sig_dl_progress.connect(self._on_dl_progress)
+        if self._embedded:
+            self._esc_key = QShortcut(QKeySequence(Qt.Key_Escape), self)
+            self._esc_key.setContext(Qt.WidgetWithChildrenShortcut)
+            self._esc_key.activated.connect(self._handle_back)
         self.fill_align_sources()
 
     def _on_tab_changed(self, _idx):
@@ -591,72 +789,137 @@ class MultipartStudioDialog(QDialog):
     def _build_import_tab(self):
         page = QWidget()
         lay = QVBoxLayout(page)
+        lay.setSpacing(10)
+
+        top_card = _make_card()
+        top_lay = QVBoxLayout(top_card)
+        top_lay.setContentsMargins(14, 12, 14, 12)
+        top_lay.setSpacing(8)
+        hdr1 = QLabel("曲谱检索与导入")
+        hdr1.setObjectName("sectionTitle")
+        top_lay.addWidget(hdr1)
         row = QHBoxLayout()
         self.edit_search = QLineEdit()
         self.edit_search.setPlaceholderText("输入歌名搜索 Songsterr…")
         row.addWidget(self.edit_search, 1)
         self.btn_search = QPushButton("搜索")
+        _set_btn_icon(self.btn_search, "search")
         self.btn_search.clicked.connect(self.do_search)
         row.addWidget(self.btn_search)
         self.btn_local = QPushButton("导入本地多轨 MIDI")
+        _set_btn_icon(self.btn_local, "import")
         self.btn_local.clicked.connect(self.import_local_midi)
         row.addWidget(self.btn_local)
-        lay.addLayout(row)
+        top_lay.addLayout(row)
         self.lbl_status = QLabel("可搜索在线曲谱，或直接导入本地多轨 MIDI。")
         self.lbl_status.setObjectName("sub")
-        lay.addWidget(self.lbl_status)
+        self.lbl_status.setWordWrap(True)
+        top_lay.addWidget(self.lbl_status)
         self.results = QListWidget()
         self.results.setMaximumHeight(150)
         self.results.itemDoubleClicked.connect(self.load_song)
-        lay.addWidget(self.results)
+        top_lay.addWidget(self.results)
+        lay.addWidget(top_card)
+
+        mid_card = _make_card()
+        mid_lay = QVBoxLayout(mid_card)
+        mid_lay.setContentsMargins(12, 10, 12, 10)
+        mid_lay.setSpacing(8)
+        hdr2 = QLabel("轨道列表与导出目标")
+        hdr2.setObjectName("sectionTitle")
+        mid_lay.addWidget(hdr2)
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("歌名"))
         self.edit_song = QLineEdit()
         row2.addWidget(self.edit_song, 1)
-        lay.addLayout(row2)
+        mid_lay.addLayout(row2)
         self.track_list = QListWidget()
         self.track_list.itemDoubleClicked.connect(self._rename_track)
-        lay.addWidget(self.track_list, 1)
+        mid_lay.addWidget(self.track_list, 1)
         self.lbl_hint = QLabel("双击轨道可改前缀；输出到 out/<歌名>/。")
         self.lbl_hint.setObjectName("sub")
-        lay.addWidget(self.lbl_hint)
+        self.lbl_hint.setWordWrap(True)
+        mid_lay.addWidget(self.lbl_hint)
         row3 = QHBoxLayout()
+        row3.addWidget(QLabel("导出目标乐器"))
+        self.cmb_export_mode = QComboBox()
+        self.cmb_export_mode.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_export_mode.setMinimumContentsLength(10)
+        self.cmb_export_mode.addItem("吉他轮盘 (40~88)", "guitar_fret")
+        self.cmb_export_mode.addItem("吉他 36 键 (52~87)", "guitar_36")
+        self.cmb_export_mode.addItem("钢琴 36 键 (60~95)", "piano_36")
+        self.cmb_export_mode.currentIndexChanged.connect(self._sync_align_mode_from_export)
+        row3.addWidget(self.cmb_export_mode)
         row3.addStretch(1)
         self.btn_generate = QPushButton("生成分轨并归档")
+        self.btn_generate.setObjectName("primary")
+        _set_btn_icon(self.btn_generate, "check", color="#FFFFFF")
         self.btn_generate.clicked.connect(self.generate)
         row3.addWidget(self.btn_generate)
-        lay.addLayout(row3)
+        mid_lay.addLayout(row3)
+        lay.addWidget(mid_card, 1)
         return page
 
     def _build_align_tab(self):
         page = QWidget()
         lay = QVBoxLayout(page)
+        lay.setSpacing(8)
+
+        src_card = _make_card()
+        src_lay = QVBoxLayout(src_card)
+        src_lay.setContentsMargins(12, 10, 12, 10)
+        src_lay.setSpacing(6)
+        hdr = QLabel("人声与伴奏对齐源")
+        hdr.setObjectName("sectionTitle")
+        src_lay.addWidget(hdr)
         row = QHBoxLayout()
         row.addWidget(QLabel("参考伴奏轨"))
         self.cmb_ref = QComboBox()
+        self.cmb_ref.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_ref.setMinimumContentsLength(12)
+        self.cmb_ref.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.cmb_ref.currentIndexChanged.connect(lambda _i: self.refresh_align())
         row.addWidget(self.cmb_ref, 1)
         self.btn_ref = QPushButton("浏览…")
+        _set_btn_icon(self.btn_ref, "folder")
         self.btn_ref.clicked.connect(lambda: self._pick_midi(self.cmb_ref))
         row.addWidget(self.btn_ref)
-        lay.addLayout(row)
+        src_lay.addLayout(row)
         row = QHBoxLayout()
         row.addWidget(QLabel("待对齐转录轨"))
         self.cmb_target = QComboBox()
+        self.cmb_target.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_target.setMinimumContentsLength(12)
+        self.cmb_target.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.cmb_target.currentIndexChanged.connect(lambda _i: self.refresh_align())
         row.addWidget(self.cmb_target, 1)
         self.btn_target = QPushButton("浏览…")
+        _set_btn_icon(self.btn_target, "folder")
         self.btn_target.clicked.connect(lambda: self._pick_midi(self.cmb_target))
         row.addWidget(self.btn_target)
-        lay.addLayout(row)
+        src_lay.addLayout(row)
+        lay.addWidget(src_card)
+
+        canvas_card = _make_card()
+        canvas_lay = QVBoxLayout(canvas_card)
+        canvas_lay.setContentsMargins(10, 10, 10, 10)
+        canvas_lay.setSpacing(6)
         self.canvas = AlignCanvas()
-        lay.addWidget(self.canvas, 1)
-        lay.addWidget(self.canvas.hbar)
+        canvas_lay.addWidget(self.canvas, 1)
+        canvas_lay.addWidget(self.canvas.hbar)
+        lay.addWidget(canvas_card, 1)
+
+        ctrl_card = _make_card()
+        ctrl_lay = QVBoxLayout(ctrl_card)
+        ctrl_lay.setContentsMargins(10, 8, 10, 8)
+        ctrl_lay.setSpacing(6)
         row = QHBoxLayout()
+        row.setSpacing(6)
         row.addWidget(QLabel("起点偏移(秒)"))
         self.spin_offset = QDoubleSpinBox()
         self.spin_offset.setRange(-60.0, 60.0)
         self.spin_offset.setSingleStep(0.02)
+        self.spin_offset.setMaximumWidth(86)
         self.spin_offset.valueChanged.connect(self.canvas.set_offset)
         self.canvas.offsetChanged.connect(self.spin_offset.setValue)
         row.addWidget(self.spin_offset)
@@ -664,10 +927,13 @@ class MultipartStudioDialog(QDialog):
         self.spin_scale = QDoubleSpinBox()
         self.spin_scale.setRange(50.0, 150.0)
         self.spin_scale.setValue(100.0)
+        self.spin_scale.setMaximumWidth(86)
         self.spin_scale.valueChanged.connect(lambda v: self.canvas.set_scale(v / 100.0))
         row.addWidget(self.spin_scale)
         row.addWidget(QLabel("吸附"))
         self.cmb_snap = QComboBox()
+        self.cmb_snap.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_snap.setMinimumContentsLength(8)
         self.cmb_snap.addItem("自由 (无吸附)", 0)
         self.cmb_snap.addItem("1/4 拍", 1)
         self.cmb_snap.addItem("1/2 拍", 2)
@@ -678,34 +944,98 @@ class MultipartStudioDialog(QDialog):
         row.addWidget(self.cmb_snap)
         self.canvas.set_snap(self.cmb_snap.currentData())
         self.btn_auto = QPushButton("自动对齐首音")
+        _set_btn_icon(self.btn_auto, "spark")
         self.btn_auto.clicked.connect(self.auto_align)
         row.addWidget(self.btn_auto)
-        self.btn_preview = QPushButton("▶ 试听")
+        row.addStretch(1)
+        ctrl_lay.addLayout(row)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+        self.btn_preview = QPushButton("试听" if _make_vector_icon else "▶ 试听")
+        _set_btn_icon(self.btn_preview, "play")
         self.btn_preview.clicked.connect(self._toggle_preview)
-        row.addWidget(self.btn_preview)
-        self.btn_stop = QPushButton("⏹ 停止")
+        row2.addWidget(self.btn_preview)
+        self.btn_stop = QPushButton("停止" if _make_vector_icon else "× 停止")
+        _set_btn_icon(self.btn_stop, "stop")
         self.btn_stop.clicked.connect(self.stop_preview)
-        row.addWidget(self.btn_stop)
+        row2.addWidget(self.btn_stop)
+        row2.addWidget(QLabel("音量"))
         self.sld_vol = QSlider(Qt.Horizontal)
         self.sld_vol.setRange(0, 100)
         self.sld_vol.setValue(60)
-        self.sld_vol.setFixedWidth(60)
-        row.addWidget(self.sld_vol)
-        row.addStretch(1)
-        lay.addLayout(row)
-        row2 = QHBoxLayout()
+        self.sld_vol.setFixedWidth(56)
+        row2.addWidget(self.sld_vol)
+        row2.addWidget(QLabel("目标乐器"))
+        self.cmb_align_mode = QComboBox()
+        self.cmb_align_mode.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_align_mode.setMinimumContentsLength(10)
+        self.cmb_align_mode.addItem("吉他轮盘 (40~88)", "guitar_fret")
+        self.cmb_align_mode.addItem("吉他 36 键 (52~87)", "guitar_36")
+        self.cmb_align_mode.addItem("钢琴 36 键 (60~95)", "piano_36")
+        row2.addWidget(self.cmb_align_mode)
         row2.addStretch(1)
+        self.lbl_align_ok = QLabel("")
+        self.lbl_align_ok.setWordWrap(True)
+        ok_col = "#34D399" if AlignCanvas._is_dark() else "#059669"
+        self.lbl_align_ok.setStyleSheet("color: %s; font-weight: 700;" % ok_col)
+        row2.addWidget(self.lbl_align_ok)
         self.btn_apply_align = QPushButton("确认对齐并覆盖保存")
+        self.btn_apply_align.setObjectName("primary")
+        _set_btn_icon(self.btn_apply_align, "check", color="#FFFFFF")
         self.btn_apply_align.clicked.connect(self.apply_align)
         row2.addWidget(self.btn_apply_align)
-        self.lbl_align_ok = QLabel("")
-        self.lbl_align_ok.setStyleSheet("color: #16a34a; font-weight: 700;")
-        row2.addWidget(self.lbl_align_ok)
-        lay.addLayout(row2)
+        ctrl_lay.addLayout(row2)
+        lay.addWidget(ctrl_card)
         self._space_key = QShortcut(QKeySequence(Qt.Key_Space), page)
         self._space_key.setContext(Qt.WidgetWithChildrenShortcut)
         self._space_key.activated.connect(self._toggle_preview)
         return page
+
+    def _sync_align_mode_from_export(self, _idx=0):
+        if not hasattr(self, "cmb_align_mode") or not hasattr(self, "cmb_export_mode"):
+            return
+        data = self.cmb_export_mode.currentData()
+        idx = self.cmb_align_mode.findData(data)
+        if idx >= 0:
+            self.cmb_align_mode.setCurrentIndex(idx)
+
+    def refresh_theme(self):
+        """主题切换时刷新工坊内矢量图标、状态文本色与画布。"""
+        _set_btn_icon(getattr(self, "btn_search", None), "search")
+        _set_btn_icon(getattr(self, "btn_local", None), "import")
+        _set_btn_icon(getattr(self, "btn_generate", None), "check", color="#FFFFFF")
+        _set_btn_icon(getattr(self, "btn_ref", None), "folder")
+        _set_btn_icon(getattr(self, "btn_target", None), "folder")
+        _set_btn_icon(getattr(self, "btn_auto", None), "spark")
+        _set_btn_icon(getattr(self, "btn_stop", None), "stop")
+        _set_btn_icon(getattr(self, "btn_apply_align", None), "check", color="#FFFFFF")
+        timer = getattr(self, "_play_timer", None)
+        playing = bool(timer is not None and timer.isActive())
+        _set_btn_icon(getattr(self, "btn_preview", None), "pause" if playing else "play")
+        if hasattr(self, "lbl_align_ok") and self.lbl_align_ok is not None:
+            ok_col = "#34D399" if AlignCanvas._is_dark() else "#059669"
+            self.lbl_align_ok.setStyleSheet("color: %s; font-weight: 700;" % ok_col)
+        if hasattr(self, "canvas") and self.canvas is not None:
+            self.canvas.update()
+
+    def _cleanup_wav(self):
+        path, self._wav_path = getattr(self, "_wav_path", None), None
+        if path:
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except Exception as exc:  # noqa: BLE001
+                _log_exc("_cleanup_wav", exc)
+
+    def _clear_align_ok(self):
+        if getattr(self, "_closing", False):
+            return
+        try:
+            if hasattr(self, "lbl_align_ok") and self.lbl_align_ok is not None:
+                self.lbl_align_ok.setText("")
+        except RuntimeError:
+            pass
 
     def _toggle_preview(self):
         timer = getattr(self, "_play_timer", None)
@@ -714,10 +1044,12 @@ class MultipartStudioDialog(QDialog):
             try:
                 import winsound
                 winsound.PlaySound(None, winsound.SND_PURGE)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                _log_exc("_toggle_preview winsound stop", exc)
+            self._cleanup_wav()
             self.btn_preview.setEnabled(True)
-            self.btn_preview.setText("▶ 试听")
+            self.btn_preview.setText("试听" if _make_vector_icon else "▶ 试听")
+            _set_btn_icon(self.btn_preview, "play")
             return
         self.preview()
 
@@ -732,6 +1064,8 @@ class MultipartStudioDialog(QDialog):
         pattern = self.edit_search.text().strip()
         if not pattern:
             return
+        self._search_seq += 1
+        seq = self._search_seq
         self.lbl_status.setText("搜索中…")
 
         def work():
@@ -740,15 +1074,26 @@ class MultipartStudioDialog(QDialog):
                 rows = search_songs(pattern)
             except Exception as exc:  # noqa: BLE001
                 err = str(exc)
-            self.sig_search_done.emit(rows, err)
+            if seq != self._search_seq or getattr(self, "_closing", False):
+                return
+            try:
+                self.sig_search_done.emit(rows, err)
+            except RuntimeError:
+                pass
 
         threading.Thread(target=work, daemon=True).start()
 
     def _on_search_done(self, rows, err):
+        if getattr(self, "_closing", False):
+            return
         if err:
             self.lbl_status.setText("离线或接口不可用：%s（可改用本地导入）" % err)
             return
         self.results.clear()
+        rows = list(rows or [])
+        if not rows:
+            self.lbl_status.setText("未找到匹配的曲谱，请换个关键词试试。")
+            return
         for r in rows[:30]:
             item = QListWidgetItem("%s - %s" % (r.get("artist") or "", r.get("title") or ""))
             item.setData(Qt.UserRole, r.get("songId"))
@@ -759,6 +1104,8 @@ class MultipartStudioDialog(QDialog):
         song_id = item.data(Qt.UserRole)
         if not song_id:
             return
+        self._load_seq += 1
+        seq = self._load_seq
         self.lbl_status.setText("下载曲谱信息…")
 
         def work():
@@ -767,14 +1114,22 @@ class MultipartStudioDialog(QDialog):
                 meta = fetch_meta(song_id)
             except Exception as exc:  # noqa: BLE001
                 err = str(exc)
-            self.sig_meta_done.emit(meta, int(song_id), err)
+            if seq != self._load_seq or getattr(self, "_closing", False):
+                return
+            try:
+                self.sig_meta_done.emit(meta, int(song_id), err)
+            except RuntimeError:
+                pass
 
         threading.Thread(target=work, daemon=True).start()
 
     def _on_meta_done(self, meta, song_id, err):
+        if getattr(self, "_closing", False):
+            return
         if err or not meta:
             self.lbl_status.setText("曲谱信息获取失败：%s" % (err or "未知错误"))
             return
+        seq = self._load_seq
         self.song_name = (meta.get("title") or "未命名").strip()
         self.edit_song.setText(self.song_name)
         self._meta = meta
@@ -801,14 +1156,24 @@ class MultipartStudioDialog(QDialog):
         self.btn_generate.setEnabled(False)
         self.lbl_status.setText("%s · %d 轨，准备下载分轨…" % (
             self.song_name, len(self.tracks)))
-        threading.Thread(target=self._download_all, daemon=True).start()
+        tracks_snap = list(self.tracks)
+        threading.Thread(
+            target=self._download_all,
+            args=(seq, int(song_id), tracks_snap, meta),
+            daemon=True,
+        ).start()
 
-    def _download_all(self):
-        total = max(1, len(self.tracks))
-        for idx, t in enumerate(self.tracks):
+    def _download_all(self, load_seq=None, song_id=None, tracks=None, meta=None):
+        seq = self._load_seq if load_seq is None else load_seq
+        sid = getattr(self, "_song_id", 0) if song_id is None else song_id
+        track_list = self.tracks if tracks is None else tracks
+        meta_obj = getattr(self, "_meta", None) if meta is None else meta
+        total = max(1, len(track_list))
+        for idx, t in enumerate(track_list):
+            if seq != self._load_seq or getattr(self, "_closing", False):
+                return
             try:
-                js = fetch_track(self._song_id, t.get("part_id", idx),
-                                 meta=getattr(self, "_meta", None))
+                js = fetch_track(sid, t.get("part_id", idx), meta=meta_obj)
                 if js.get("isDrums"):
                     t["notes"] = []
                     t["error"] = "打击乐轨已跳过"
@@ -817,9 +1182,16 @@ class MultipartStudioDialog(QDialog):
             except Exception as exc:  # noqa: BLE001
                 t["notes"] = []
                 t["error"] = str(exc)
-            self.sig_dl_progress.emit(idx + 1, total, t.get("name") or "")
+            if seq != self._load_seq or getattr(self, "_closing", False):
+                return
+            try:
+                self.sig_dl_progress.emit(idx + 1, total, t.get("name") or "")
+            except RuntimeError:
+                return
 
     def _on_dl_progress(self, done, total, name):
+        if getattr(self, "_closing", False):
+            return
         self.lbl_status.setText("正在下载分轨 (%d/%d)… %s" % (done, total, name))
         if done >= total:
             self.btn_generate.setEnabled(True)
@@ -878,38 +1250,35 @@ class MultipartStudioDialog(QDialog):
 
     def generate(self):
         song = _safe_filename(self.edit_song.text().strip() or self.song_name or "未命名")
+        constraint_mode = str(self.cmb_export_mode.currentData() or "guitar_fret")
+        lo, hi = _constraint_range(constraint_mode)
         parts, mix_parts, total, dropped = [], [], 0, 0
         for i in range(self.track_list.count()):
             item = self.track_list.item(i)
             if item.checkState() != Qt.Checked:
                 continue
             t = self.tracks[item.data(Qt.UserRole)]
-            notes = _fold_notes(t.get("notes") or [])
-            kept, st = sanitize_fret_frame(notes)
+            notes = _fold_notes(t.get("notes") or [], lo, hi)
+            kept, st = sanitize_fret_frame(notes, constraint_mode=constraint_mode)
             dropped += st["dropped"]
             if kept:
-                parts.append((t["prefix"], [CV.Note(pitch=n["pitch"], start_sec=n["t"],
-                                                    end_sec=n["t"] + n["dur"],
-                                                    velocity=n.get("vel", 80))
-                                            for n in kept]))
+                parts.append((t["prefix"], _to_cv_notes(kept)))
                 total += len(kept)
             if notes:
-                mix_parts.append((t["prefix"], [CV.Note(pitch=n["pitch"], start_sec=n["t"],
-                                                        end_sec=n["t"] + n["dur"],
-                                                        velocity=n.get("vel", 80))
-                                                for n in notes]))
+                mix_parts.append((t["prefix"], _to_cv_notes(notes)))
         if not parts:
             QMessageBox.information(self, "没有可生成的分轨",
                                     "先载入曲谱或本地 MIDI，并勾选至少一条轨道。")
             return
-        made = write_parts(song, parts, mix_parts=mix_parts)
+        made = write_parts(song, parts, mix_parts=mix_parts,
+                           constraint_mode=constraint_mode, sanitize=False)
         self.lbl_status.setText("已生成 %d 个文件到 out/%s/（清洗剔除 %d 音），"
                                 "可在演奏页曲库查看。" % (len(made), song, dropped))
         if self.on_done:
             try:
                 self.on_done()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                _log_exc("generate on_done", exc)
 
     def fill_align_sources(self):
         files = []
@@ -962,7 +1331,8 @@ class MultipartStudioDialog(QDialog):
         return out
 
     def preview(self):
-        self.refresh_align()
+        if not getattr(self, "_align_ref", None) and not getattr(self, "_align_tgt", None):
+            self.refresh_align()
         start = max(0.0, float(self.canvas.playhead_sec))
         ref = [dict(n, t=float(n["t"]) - start) for n in getattr(self, "_align_ref", [])
                if float(n["t"]) >= start]
@@ -971,6 +1341,12 @@ class MultipartStudioDialog(QDialog):
         notes = ref + tgt
         if not notes:
             return
+        try:
+            import winsound
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+        self._cleanup_wav()
         try:
             import piano_roll as PR
             data = PR.PianoRollModel.synthesize_wav(notes, 120.0)
@@ -985,9 +1361,13 @@ class MultipartStudioDialog(QDialog):
             with wave.open(path, "wb") as out:
                 out.setparams(params)
                 out.writeframes(frames)
-            import winsound
-            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            self._wav_path = path
+            winsound.PlaySound(
+                path,
+                winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+            )
         except Exception as exc:  # noqa: BLE001
+            self._cleanup_wav()
             QMessageBox.warning(self, "试听失败", str(exc))
             return
         end = max(float(n["t"]) + float(n.get("dur") or 0) for n in notes)
@@ -1000,7 +1380,8 @@ class MultipartStudioDialog(QDialog):
             self._play_timer.timeout.connect(self._tick_playhead)
         self._play_timer.start()
         self.btn_preview.setEnabled(True)
-        self.btn_preview.setText("⏸ 暂停")
+        self.btn_preview.setText("暂停" if _make_vector_icon else "|| 暂停")
+        _set_btn_icon(self.btn_preview, "pause")
 
     def _tick_playhead(self):
         pos = self._play_start_sec + (time.perf_counter() - self._play_t0)
@@ -1019,40 +1400,63 @@ class MultipartStudioDialog(QDialog):
         try:
             import winsound
             winsound.PlaySound(None, winsound.SND_PURGE)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            _log_exc("stop_preview winsound", exc)
+        self._cleanup_wav()
         if getattr(self, "btn_preview", None) is not None:
             self.btn_preview.setEnabled(True)
-            self.btn_preview.setText("▶ 试听")
+            self.btn_preview.setText("试听" if _make_vector_icon else "▶ 试听")
+            _set_btn_icon(self.btn_preview, "play")
         if getattr(self, "canvas", None) is not None and hasattr(self, "_play_start_sec"):
             self.canvas.set_playhead(self._play_start_sec)
 
     def closeEvent(self, ev):
+        self._closing = True
         self.stop_preview()
         super(MultipartStudioDialog, self).closeEvent(ev)
 
+    def _handle_back(self):
+        self.stop_preview()
+        if callable(self._on_back):
+            self._on_back()
+
     def reject(self):
         self.stop_preview()
+        if self._embedded:
+            if callable(self._on_back):
+                self._on_back()
+            return
         super(MultipartStudioDialog, self).reject()
+
+    def keyPressEvent(self, ev):
+        if self._embedded and ev.key() == Qt.Key_Escape:
+            self._handle_back()
+            ev.accept()
+            return
+        super(MultipartStudioDialog, self).keyPressEvent(ev)
 
     def apply_align(self):
         tgt_path = self.cmb_target.currentData()
         if not tgt_path or not os.path.isfile(str(tgt_path)):
             QMessageBox.information(self, "未选择待对齐轨", "先选择一条转录 MIDI。")
             return
-        notes = self._scaled_notes()
-        kept, st = sanitize_fret_frame(notes)
+        constraint_mode = (str(self.cmb_align_mode.currentData() or "guitar_fret")
+                           if hasattr(self, "cmb_align_mode") else "guitar_fret")
+        lo, hi = _constraint_range(constraint_mode)
+        notes = _fold_notes(self._scaled_notes(), lo, hi)
+        kept, st = sanitize_fret_frame(notes, constraint_mode=constraint_mode)
         if not kept:
             QMessageBox.warning(self, "对齐失败", "清洗后没有剩余音符。")
             return
         orig_bpm = _read_bpm(str(tgt_path))
+        text_ev = [(0, "SOLO_MODE:fret")] if constraint_mode == "guitar_fret" else []
         try:
             bak_dir = os.path.join(ROOT, "logs", "backup_align")
             os.makedirs(bak_dir, exist_ok=True)
             shutil.copy2(str(tgt_path),
                          os.path.join(bak_dir, os.path.basename(str(tgt_path)) + ".bak"))
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            _log_exc("apply_align backup", exc)
         try:
             CV.write_midi(str(tgt_path),
                           [CV.TrackNotes("Vocal",
@@ -1061,8 +1465,9 @@ class MultipartStudioDialog(QDialog):
                                                   velocity=n.get("vel", 80))
                                           for n in kept])],
                           bpm=orig_bpm,
-                          text_events=[(0, "SOLO_MODE:fret")])
+                          text_events=text_ev)
         except Exception as exc:  # noqa: BLE001
+            _log_exc("apply_align write_midi", exc)
             QMessageBox.warning(self, "保存失败", str(exc))
             return
         folder = os.path.dirname(str(tgt_path))
@@ -1091,15 +1496,15 @@ class MultipartStudioDialog(QDialog):
                     merged.append(new_track if i == keep_at else tr)
                 if keep_at is None:
                     merged.append(new_track)
-                CV.write_midi(tiles[0], merged, bpm=orig_bpm)
-            except Exception:
-                pass
+                CV.write_midi(tiles[0], merged, bpm=orig_bpm, text_events=text_ev)
+            except Exception as exc:  # noqa: BLE001
+                _log_exc("apply_align merge full mix", exc)
         if self.on_done:
             try:
                 self.on_done()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                _log_exc("apply_align on_done", exc)
         self.lbl_status.setText("已覆盖保存：%s（清洗剔除 %d 音）"
                                 % (os.path.basename(str(tgt_path)), st["dropped"]))
         self.lbl_align_ok.setText("✔ 已保存")
-        QTimer.singleShot(4000, lambda: self.lbl_align_ok.setText(""))
+        QTimer.singleShot(4000, self._clear_align_ok)

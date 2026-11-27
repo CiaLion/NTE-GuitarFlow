@@ -61,8 +61,8 @@ class MERT2MelFrontend(nn.Module):
         return self
 
     def _cpu_frontend(self):
-        # DirectML aborts on ComplexFloat / STFT, so the mel frontend keeps a
-        # CPU mirror of the spectrogram + mel modules. It is a plain dict, so
+        # Some backends abort on ComplexFloat / STFT, so the mel frontend keeps
+        # a CPU mirror of the spectrogram + mel modules. It is a plain dict, so
         # model.to(device) never drags these copies onto the GPU.
         cache = getattr(self, "_cpu_frontend_cache", None)
         if cache is None:
@@ -80,7 +80,7 @@ class MERT2MelFrontend(nn.Module):
     @torch.no_grad()
     def forward(self, waveform):
         dev = waveform.device
-        # privateuseone == torch_directml device: run the STFT/mel part on CPU,
+        # privateuseone (vendor fallback backend): run the STFT/mel part on CPU,
         # then hand the result back to the GPU for the Conformer stack.
         if str(getattr(dev, "type", "")).lower().startswith("private"):
             c = self._cpu_frontend()

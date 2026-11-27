@@ -44,7 +44,7 @@ for _cand_plug in (
         os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", str(_cand_plug / "platforms"))
         break
 
-from PyQt5.QtCore import (QEvent, QPoint, QRect, Qt, QTimer, QUrl,  # noqa: E402
+from PyQt5.QtCore import (QEvent, QPoint, QRect, QSize, Qt, QTimer, QUrl,  # noqa: E402
                           pyqtSignal)
 from PyQt5.QtGui import (QColor, QFont, QKeySequence, QPainter,  # noqa: E402
                          QPen, QPolygon)
@@ -52,21 +52,96 @@ from PyQt5.QtWidgets import (QAbstractScrollArea, QApplication, QCheckBox,  # no
                              QComboBox, QDialog, QFileDialog, QHBoxLayout,
                              QFrame, QLabel, QMessageBox, QPushButton,
                              QScrollArea, QShortcut, QSizePolicy, QSlider,
-                             QVBoxLayout, QWidget)
+                             QSpinBox, QVBoxLayout, QWidget)
 
 import midi_compiler as MC  # noqa: E402
 import guitar_plan as GP  # noqa: E402
 import player_config as PC  # noqa: E402
 import convert as CV  # noqa: E402
+try:
+    import keyboard_layout as KL  # noqa: E402
+except Exception:  # noqa: BLE001
+    KL = None
+try:
+    from core_utils import get_logger as _get_logger  # noqa: E402
+except Exception:  # noqa: BLE001
+    _get_logger = None
+try:
+    from ui_widgets import make_vector_icon as _make_vector_icon  # noqa: E402
+except Exception:  # noqa: BLE001
+    _make_vector_icon = None
+
+
+def _log_exc(ctx, exc):
+    if _get_logger is not None:
+        try:
+            _get_logger("piano_roll").debug("%s: %s", ctx, exc)
+        except Exception:
+            pass
 
 PITCH_MIN = 40
 PITCH_MAX = 88
 DISPLAY_LO = 36
 DISPLAY_HI = 96
 KEY_W = 64
+KB_KEY_W = 86
 RULER_H = 28
 MIN_DUR = MC.KEY_HOLD if hasattr(MC, "KEY_HOLD") else 0.025
 ALL_CHORDS = list(getattr(GP, "ALL_CHORDS", []) or [])
+
+INSTRUMENT_GUITAR_WHEEL = getattr(KL, "INSTRUMENT_GUITAR_WHEEL", "guitar_wheel")
+INSTRUMENT_GUITAR_36 = getattr(KL, "INSTRUMENT_GUITAR_36", "guitar_36")
+INSTRUMENT_PIANO_36 = getattr(KL, "INSTRUMENT_PIANO_36", "piano_36")
+
+
+def _is_kb36_mode(mode):
+    return str(mode or INSTRUMENT_GUITAR_WHEEL) in (
+        INSTRUMENT_GUITAR_36, INSTRUMENT_PIANO_36)
+
+
+def _range_for_mode(mode):
+    m = str(mode or INSTRUMENT_GUITAR_WHEEL)
+    if KL is not None and hasattr(KL, "INSTRUMENT_RANGES"):
+        r = KL.INSTRUMENT_RANGES.get(m)
+        if r and len(r) == 2:
+            return int(r[0]), int(r[1])
+    if m == INSTRUMENT_GUITAR_36:
+        return 52, 87
+    if m == INSTRUMENT_PIANO_36:
+        return 60, 95
+    return PITCH_MIN, PITCH_MAX
+
+
+def _key_label(pitch, mode):
+    if KL is not None and hasattr(KL, "key_label_for_pitch"):
+        try:
+            return str(KL.key_label_for_pitch(int(pitch), mode) or "")
+        except Exception:
+            pass
+    return ""
+
+
+def _key_binding(pitch, mode):
+    if KL is not None and hasattr(KL, "pitch_to_binding"):
+        try:
+            return KL.pitch_to_binding(int(pitch), mode)
+        except Exception:
+            pass
+    return None
+
+
+def _fold_pitch_to_bounds(pitch, low, high):
+    if KL is not None and hasattr(KL, "fold_pitch"):
+        try:
+            return int(KL.fold_pitch(int(pitch), int(low), int(high)))
+        except Exception:
+            pass
+    p = int(pitch)
+    while p < low:
+        p += 12
+    while p > high:
+        p -= 12
+    return max(low, min(high, p))
 
 PLAY_ROLE_LABELS = {
     "solo": "1P 单人独奏（Solo 指弹）",
@@ -105,16 +180,24 @@ class PianoRollModel(object):
 
     MAX_UNDO = 50
 
-    def __init__(self, path=None, role=None, song=None):
+    def __init__(self, path=None, role=None, song=None,
+                 instrument_mode="guitar_wheel", kb_track_scope="all", transpose=0,
+                 kb_arrange_mode="raw", kb_arrange_opts=None):
         self.path = str(path) if path else None
         self.role = role
         self.song = song
+        self.instrument_mode = str(instrument_mode or INSTRUMENT_GUITAR_WHEEL)
+        self.kb_track_scope = str(kb_track_scope or "all")
+        self.transpose = int(transpose or 0)
+        self.kb_arrange_mode = str(kb_arrange_mode or "raw")
+        self.kb_arrange_opts = dict(kb_arrange_opts or {})
         self.kind = None
         self.mode = "role" if role else "midi"
         self.track_name = "Main Melody"
         self.tracks = []
         self.track_idx = 0
         self.notes = []
+        self._kb_raw_notes = []
         self.markers = []
         self.slices = []
         # v1.1：2P 混切分段（[(秒, "chord"|"fret")]），卷帘按它分段校验/上色
@@ -135,8 +218,20 @@ class PianoRollModel(object):
         self._undo = []
         self._redo = []
         self._suspend_undo = 0
+        self._kb_edited = False
         if path:
             self.load(path, role=role)
+
+    def is_kb36(self):
+        return _is_kb36_mode(self.instrument_mode)
+
+    def pitch_bounds(self):
+        return _range_for_mode(self.instrument_mode)
+
+    def _clamp_pitch_mode(self, p):
+        if self.is_kb36():
+            return max(DISPLAY_LO, min(DISPLAY_HI, int(round(float(p)))))
+        return _clamp_pitch(p)
 
     # ── 读 ──────────────────────────────────────────────────────────────
     def load(self, path, role=None, force_recalc=False):
@@ -145,6 +240,13 @@ class PianoRollModel(object):
         self.mode = "role" if role else "midi"
         self._undo, self._redo = [], []
         self.force_recalc = bool(force_recalc)
+        if self.is_kb36():
+            self._load_kb36()
+            if role:
+                self.role_notes[self.role] = [dict(n) for n in self.notes]
+                self._role_undo[self.role] = []
+                self._role_redo[self.role] = []
+            return
         if role:
             self._load_role(force_recalc=force_recalc)
             self.role_notes[self.role] = [dict(n) for n in self.notes]
@@ -152,6 +254,171 @@ class PianoRollModel(object):
             self._role_redo[self.role] = []
         else:
             self._load_midi()
+
+    def _load_kb36(self):
+        """36 键模式下加载 MIDI 音符：优先使用 keyboard_layout 统一选轨、移调与折叠。"""
+        import re as _re
+        drum_re = _re.compile(
+            r"\b(drum|drums|percussion|cymbals?)\b|\bdrum\s*kit\b|\btama\b",
+            _re.IGNORECASE,
+        )
+        raw_tracks = [t for t in CV.read_midi_tracks(self.path)]
+        self.tracks = [t for t in raw_tracks
+                       if t.notes and not getattr(t, "is_drum", False)
+                       and not drum_re.search(str(t.name or ""))]
+        if not self.tracks:
+            self.tracks = [t for t in raw_tracks if t.notes]
+        try:
+            meta = MC.read_meta(self.path)
+            self.bpm = _as_float(meta.get("bpm"), 120.0) or 120.0
+        except Exception:
+            self.bpm = 120.0
+        self.beat_sec = 60.0 / self.bpm if self.bpm else 0.5
+        self.kind = self.instrument_mode
+        self.markers, self.slices, self.mode_markers = [], [], []
+        self.song = {"path": self.path, "bpm": self.bpm, "track_names": [t.name for t in self.tracks]}
+        self.track_name = self._kb_scope_label()
+        if KL is not None and hasattr(KL, "compile_keyboard_song"):
+            opts = dict(getattr(self, "kb_arrange_opts", None) or {})
+            tl = KL.compile_keyboard_song(
+                self.path, self.instrument_mode,
+                timing=self.timing, track_scope=self.kb_track_scope,
+                transpose=self.transpose, detail=True,
+                arrange_mode=getattr(self, "kb_arrange_mode", "raw"),
+                enable_auto_accomp=opts.get("kb_auto_accomp", True),
+                enable_arpeggio=opts.get("kb_enable_arpeggio", True),
+                enable_chord_rhythm=opts.get("kb_enable_chord_rhythm", True),
+                strum_roll=opts.get("kb_strum_roll", False),
+                arp_pattern=opts.get("kb_arp_pattern", "ascending"),
+                solo_arpeggio=opts.get("kb_solo_arpeggio"),
+                p2_arpeggio=opts.get("kb_p2_arpeggio"),
+            )
+            self.notes = [dict(n, is_melody=True) for n in (tl.get("notes") or [])]
+            self._kb_raw_notes = [dict(n) for n in self.notes]
+            self._kb_edited = False
+            self.tl = tl
+            self._index_analysis(tl.get("analysis") or {})
+            return
+        chosen = self._select_kb_tracks()
+        raw_notes = []
+        seen = set()
+        for tr in chosen:
+            for n in tr.notes:
+                t0 = round(max(0.0, float(n.start_sec)), 6)
+                dur = round(max(MIN_DUR, float(n.end_sec) - float(n.start_sec)), 6)
+                p = int(n.pitch)
+                key = (round(t0, 3), p)
+                if key in seen:
+                    continue
+                seen.add(key)
+                raw_notes.append({
+                    "t": t0, "dur": dur, "pitch": p,
+                    "vel": int(getattr(n, "velocity", 80) or 80),
+                    "is_melody": True,
+                })
+        raw_notes.sort(key=lambda x: (x["t"], x["pitch"]))
+        self._kb_raw_notes = raw_notes
+        self._kb_edited = False
+        lo, hi = self.pitch_bounds()
+        self.notes = [dict(n, pitch=_fold_pitch_to_bounds(int(n["pitch"]) + self.transpose, lo, hi))
+                      for n in raw_notes]
+        self.compile()
+
+    def _kb_scope_label(self):
+        return {"all": "All Tracks", "melody": "Melody", "accomp": "Accomp"}.get(
+            self.kb_track_scope, "Keyboard")
+
+    def _select_kb_tracks(self):
+        if not self.tracks:
+            return []
+        if self.kb_track_scope == "all":
+            return list(self.tracks)
+        try:
+            import midi_adapter as MA
+            mel = [t for t in self.tracks if MA.is_melody_track(t.name or "")]
+            acc = [t for t in self.tracks if MA.is_chords_track(t.name or "") or t not in mel]
+        except Exception:
+            mel = [t for t in self.tracks
+                   if any(k in str(t.name or "").lower()
+                          for k in ("vocal", "melody", "lead", "主旋律", "人声", "solo"))]
+            acc = [t for t in self.tracks if t not in mel]
+        if self.kb_track_scope == "melody":
+            return mel if mel else [self.tracks[0]]
+        if self.kb_track_scope == "accomp":
+            return acc if acc else list(self.tracks)
+        return list(self.tracks)
+
+    def set_kb_scope(self, scope):
+        scope = str(scope or "all")
+        if not self.is_kb36() or (scope == self.kb_track_scope and self.kb_arrange_mode == "raw"):
+            return False
+        self.kb_arrange_mode = "raw"
+        self.kb_track_scope = scope
+        if self.path:
+            self._load_kb36()
+        return True
+
+    def set_kb_arrange(self, arrange_mode, opts=None):
+        mode = str(arrange_mode or "raw")
+        new_opts = dict(self.kb_arrange_opts or {})
+        if isinstance(opts, dict):
+            new_opts.update(opts)
+        if not self.is_kb36():
+            return False
+        if mode == self.kb_arrange_mode and new_opts == self.kb_arrange_opts:
+            return False
+        self.kb_arrange_mode = mode
+        self.kb_arrange_opts = new_opts
+        if self.path:
+            self._load_kb36()
+        return True
+
+    def set_kb_transpose(self, shift):
+        shift = max(-12, min(12, int(shift or 0)))
+        if not self.is_kb36() or shift == self.transpose:
+            return False
+        delta = shift - self.transpose
+        self._snapshot()
+        self.transpose = shift
+        lo, hi = self.pitch_bounds()
+        if not getattr(self, "_kb_edited", False) and self.path:
+            self._load_kb36()
+            return True
+        for n in self.notes:
+            n["pitch"] = _fold_pitch_to_bounds(int(n["pitch"]) + delta, lo, hi)
+        self.compile()
+        return True
+
+    def kb_coverage_info(self):
+        lo, hi = self.pitch_bounds()
+        if KL is not None and hasattr(KL, "analyze_range_and_transpose"):
+            try:
+                return KL.analyze_range_and_transpose(self.notes, self.instrument_mode)
+            except Exception:
+                pass
+        total = len(self.notes)
+        in_r = sum(1 for n in self.notes if lo <= int(n.get("pitch") or -1) <= hi)
+        best_shift, best_in = 0, in_r
+        for s in range(-12, 13):
+            cnt = sum(1 for n in self.notes if lo <= int(n.get("pitch") or -1) + s <= hi)
+            if cnt > best_in or (cnt == best_in and abs(s) < abs(best_shift)):
+                best_in, best_shift = cnt, s
+        return {
+            "in_range": in_r, "total": total,
+            "coverage": (in_r / float(total)) if total else 1.0,
+            "best_shift": best_shift,
+            "best_coverage": (best_in / float(total)) if total else 1.0,
+            "low": lo, "high": hi,
+        }
+
+    def auto_kb_transpose(self):
+        if not self.is_kb36() or not self.notes:
+            return 0
+        info = self.kb_coverage_info()
+        best_delta = int(info.get("best_shift") or 0)
+        new_shift = max(-12, min(12, self.transpose + best_delta))
+        self.set_kb_transpose(new_shift)
+        return new_shift
 
     def _sync_role_mode_state(self):
         """按当前激活角色同步 `mode_markers`、`markers` 与每个切片的 `hybrid_mode`。
@@ -260,10 +527,11 @@ class PianoRollModel(object):
     # ── 角色切换 / 开关重建（模式 B）──────────────────────────────────
     def remember_role_notes(self):
         """把当前画布上的音符与撤销栈记到该角色名下。"""
-        if self.mode == "role" and self.role:
-            self.role_notes[self.role] = [dict(n) for n in self.notes]
-            self._role_undo[self.role] = list(self._undo)
-            self._role_redo[self.role] = list(self._redo)
+        key = self.role or (self.instrument_mode if self.is_kb36() else None)
+        if (self.mode == "role" or self.is_kb36()) and key:
+            self.role_notes[key] = [dict(n) for n in self.notes]
+            self._role_undo[key] = list(self._undo)
+            self._role_redo[key] = list(self._redo)
 
     def switch_role(self, new_role):
         """在卷帘内切换演奏角色；完整恢复目标角色的音符、混切标记与撤销栈。"""
@@ -307,6 +575,8 @@ class PianoRollModel(object):
     def rebuild_for_strum_mode(self, on):
         """柱式 / 扫弦切换：写回配置并按新方式重算 2P 混切序列。"""
         self.remember_role_notes()
+        prev_undo = list(self._undo)
+        prev_snap = self._capture_state()
         melody = self.role_notes.get(MC.ROLE_DUET_LEAD)
         try:
             PC.save({"chord_strum_mode": bool(on)})
@@ -321,10 +591,14 @@ class PianoRollModel(object):
             if role == MC.ROLE_DUET_LEAD:
                 self.notes = [dict(n) for n in melody]
                 self.compile()
+        self._undo = (prev_undo + [prev_snap])[-self.MAX_UNDO:]
+        self._redo = []
 
     def rebuild_for_flags(self, enable_arpeggio, enable_chord_rhythm):
         """琶音 / 扫弦律动变化后，基于原曲重新生成 2P 与 Solo。"""
         self.remember_role_notes()
+        prev_undo = list(self._undo)
+        prev_snap = self._capture_state()
         melody = self.role_notes.get(MC.ROLE_DUET_LEAD)
         try:
             PC.save({"enable_arpeggio": bool(enable_arpeggio),
@@ -340,18 +614,36 @@ class PianoRollModel(object):
             if role == MC.ROLE_DUET_LEAD:
                 self.notes = [dict(n) for n in melody]
                 self.compile()
+        self._undo = (prev_undo + [prev_snap])[-self.MAX_UNDO:]
+        self._redo = []
 
     # ── 基础编辑（带撤销）──────────────────────────────────────────────
+    def _capture_state(self):
+        return {
+            "notes": [dict(n) for n in self.notes],
+            "transpose": int(getattr(self, "transpose", 0) or 0),
+            "kb_edited": bool(getattr(self, "_kb_edited", False)),
+        }
+
+    def _restore_state(self, state):
+        if isinstance(state, dict):
+            self.notes = [dict(n) for n in (state.get("notes") or [])]
+            self.transpose = int(state.get("transpose", self.transpose) or 0)
+            self._kb_edited = bool(state.get("kb_edited", False))
+        else:
+            self.notes = [dict(n) for n in (state or [])]
+
     def _snapshot(self):
         if self._suspend_undo:
             return
-        self._undo.append([dict(n) for n in self.notes])
+        self._undo.append(self._capture_state())
         if len(self._undo) > self.MAX_UNDO:
             self._undo.pop(0)
         self._redo = []
 
     def begin_batch(self):
         self._snapshot()
+        self._kb_edited = True
         self._suspend_undo += 1
 
     def end_batch(self):
@@ -362,10 +654,12 @@ class PianoRollModel(object):
 
     def add_note(self, t, pitch, dur=None, vel=85):
         self._snapshot()
+        self._kb_edited = True
         dur = max(MIN_DUR, _as_float(dur, 0.25))
         is_mel = self.role not in (MC.ROLE_DUET_RHYTHM, MC.ROLE_DUET_RHYTHM_FRET)
         n = {"t": round(max(0.0, _as_float(t)), 6), "dur": round(dur, 6),
-             "pitch": _clamp_pitch(pitch), "vel": max(1, min(127, int(vel))),
+             "pitch": self._clamp_pitch_mode(pitch),
+             "vel": max(1, min(127, int(vel))),
              "is_melody": is_mel}
         self.notes.append(n)
         return n
@@ -374,18 +668,21 @@ class PianoRollModel(object):
         if not notes:
             return 0
         self._snapshot()
+        self._kb_edited = True
         gone = set(id(n) for n in notes)
         before = len(self.notes)
         self.notes = [n for n in self.notes if id(n) not in gone]
         return before - len(self.notes)
 
     def move_notes(self, notes, dt, dp):
+        self._kb_edited = True
         for n in notes:
             n["t"] = round(max(0.0, n["t"] + dt), 6)
-            n["pitch"] = _clamp_pitch(n["pitch"] + dp)
+            n["pitch"] = self._clamp_pitch_mode(n["pitch"] + dp)
 
     def set_pitch(self, note, pitch):
-        note["pitch"] = _clamp_pitch(pitch)
+        self._kb_edited = True
+        note["pitch"] = self._clamp_pitch_mode(pitch)
 
     def set_time(self, note, t, keep_end=False):
         end = note["t"] + note["dur"]
@@ -400,16 +697,16 @@ class PianoRollModel(object):
     def undo(self):
         if not self._undo:
             return False
-        self._redo.append([dict(n) for n in self.notes])
-        self.notes = self._undo.pop()
+        self._redo.append(self._capture_state())
+        self._restore_state(self._undo.pop())
         self.compile()
         return True
 
     def redo(self):
         if not self._redo:
             return False
-        self._undo.append([dict(n) for n in self.notes])
-        self.notes = self._redo.pop()
+        self._undo.append(self._capture_state())
+        self._restore_state(self._redo.pop())
         self.compile()
         return True
 
@@ -418,6 +715,8 @@ class PianoRollModel(object):
         self.timing = MC.Timing()
         if self.tracks and 0 <= int(getattr(self, "track_idx", 0) or 0) < len(self.tracks):
             self.tracks[int(self.track_idx)].notes = self.to_convert_notes()
+        if self.is_kb36():
+            return self._compile_kb36()
         if self.mode != "role" or not self.role:
             self.tl = None
             return None
@@ -436,6 +735,48 @@ class PianoRollModel(object):
                                     "late": 0, "error": str(exc)}}
             self._index_analysis(self.tl["analysis"])
             return self.tl
+        self.tl = tl
+        self._index_analysis(tl.get("analysis") or {})
+        return tl
+
+    def _compile_kb36(self):
+        lo, hi = self.pitch_bounds()
+        try:
+            import inspect
+            sig = inspect.signature(MC.compile_custom_role)
+            if "instrument_mode" in sig.parameters:
+                tl = MC.compile_custom_role(
+                    self.path or self.song, self.role or MC.ROLE_SOLO, self.notes,
+                    timing=self.timing,
+                    instrument_mode=self.instrument_mode,
+                    transpose=self.transpose,
+                )
+            elif KL is not None and hasattr(KL, "compile_keyboard_song"):
+                tl = KL.compile_keyboard_song(
+                    self.path or "", self.instrument_mode,
+                    timing=self.timing, track_scope=self.kb_track_scope,
+                    transpose=0, custom_notes=self.notes,
+                )
+            else:
+                tl = None
+        except Exception as exc:  # noqa: BLE001
+            tl = {"events": [], "stats": {}, "hw_stats": {},
+                  "analysis": {"kind": self.instrument_mode, "notes": [],
+                               "dropped": 0, "late": 0, "error": str(exc)}}
+        if tl is None:
+            in_notes = [n for n in self.notes if lo <= int(n.get("pitch") or -1) <= hi]
+            dropped = len(self.notes) - len(in_notes)
+            tl = {
+                "version": 1, "role": self.role or MC.ROLE_SOLO,
+                "kind": self.instrument_mode, "instrument_mode": self.instrument_mode,
+                "stats": {"voices": len(in_notes), "dropped": dropped, "late": 0,
+                          "hw_events": len(in_notes) * 2},
+                "events": [],
+                "analysis": {"kind": self.instrument_mode, "dropped": dropped, "late": 0,
+                             "notes": [{"t": n["t"], "pitch": int(n["pitch"]),
+                                        "dropped": not (lo <= int(n["pitch"]) <= hi),
+                                        "late": 0.0} for n in self.notes]},
+            }
         self.tl = tl
         self._index_analysis(tl.get("analysis") or {})
         return tl
@@ -474,7 +815,7 @@ class PianoRollModel(object):
 
     def save_guard(self):
         """保存/应用前的硬拦截判定（不弹窗）。"""
-        if self.mode == "role":
+        if self.mode == "role" or self.is_kb36():
             try:
                 self.compile()
             except Exception:
@@ -484,6 +825,24 @@ class PianoRollModel(object):
 
     def invalid_notes(self):
         """返回红色非法音符 [(note, reason), ...]。"""
+        if self.is_kb36():
+            lo, hi = self.pitch_bounds()
+            bad = []
+            for n in self.notes:
+                try:
+                    pitch = int(n["pitch"])
+                except Exception:
+                    bad.append((n, "range"))
+                    continue
+                if pitch < 0 or pitch > 127 or pitch < lo or pitch > hi:
+                    bad.append((n, "range"))
+                    continue
+                a = self.analysis_for(n)
+                if a is not None and a.get("dropped") and a.get("reason") in ("range", "oob", None):
+                    if pitch < lo or pitch > hi:
+                        bad.append((n, "range"))
+            return sorted(bad, key=lambda x: (float(x[0].get("t") or 0), int(x[0].get("pitch") or 0)))
+
         bad = []
         for n in self.notes:
             try:
@@ -509,6 +868,18 @@ class PianoRollModel(object):
     def status_text(self):
         st = (self.tl or {}).get("stats") or {}
         n = len(self.notes)
+        if self.is_kb36():
+            lo, hi = self.pitch_bounds()
+            name = "吉他 36 键 (E3~D#6)" if self.instrument_mode == INSTRUMENT_GUITAR_36 else "钢琴 36 键 (C4~B6)"
+            dropped = int(st.get("dropped") or self.analysis.get("dropped") or 0)
+            late = int(st.get("late") or self.analysis.get("late") or 0)
+            hw = int(st.get("hw_events") or st.get("events") or 0)
+            voices = int(st.get("voices") or 0)
+            extra = ""
+            if self.instrument_mode == INSTRUMENT_PIANO_36 and st.get("batches_split") is not None:
+                extra = " ｜ 互斥拆批：%d" % int(st.get("batches_split") or 0)
+            return "%s（%d~%d）｜ 音符：%d ｜ 发声：%d ｜ 硬件动作：%d ｜ 越界：%d ｜ 晚出：%d%s" % (
+                name, lo, hi, n, voices, hw, dropped, late, extra)
         if self.mode != "role":
             return "音符：%d ｜ 音域：%s~%s ｜ 提示：<40 / >88 是深红禁区" % (
                 n, min((x["pitch"] for x in self.notes), default="-"),
@@ -646,9 +1017,24 @@ class PianoRollModel(object):
     # ── 音域归位 ────────────────────────────────────────────────────────
     def fix_range(self, instrument_mode="acoustic"):
         import pipeline as PL
+        lo, hi = self.pitch_bounds()
         notes = [CV.Note(int(n["pitch"]), float(n["t"]),
                          float(n["t"]) + float(n["dur"]), int(n["vel"]))
                  for n in self.notes]
+        if self.is_kb36():
+            fixed, stats = PL.fix_pitch_range(notes, low=lo, high=hi,
+                                              instrument_mode="electric")
+            self._snapshot()
+            self._kb_edited = True
+            fixed.sort(key=lambda x: (x.start_sec, x.pitch))
+            self.notes = [{"t": round(float(n.start_sec), 6),
+                           "dur": round(max(MIN_DUR, float(n.end_sec) - float(n.start_sec)), 6),
+                           "pitch": _fold_pitch_to_bounds(n.pitch, lo, hi),
+                           "vel": int(n.velocity),
+                           "is_melody": True} for n in fixed]
+            if self.mode == "role" or self.is_kb36():
+                self.compile()
+            return stats
         fixed, stats = PL.fix_pitch_range(notes, low=PITCH_MIN, high=PITCH_MAX,
                                           instrument_mode=instrument_mode)
         self._snapshot()
@@ -661,6 +1047,11 @@ class PianoRollModel(object):
 
     def restore_auto(self):
         """恢复默认自动编配：重新走 load_song/adapt_song 的自动结果。"""
+        if self.is_kb36():
+            if not self.path:
+                return False
+            self.load(self.path, role=self.role, force_recalc=True)
+            return True
         if self.mode != "role":
             return False
         self.role_notes = {}
@@ -737,15 +1128,18 @@ class PianoRollModel(object):
         path = str(path or self.path)
         if not path:
             raise ValueError("没有保存路径")
-        if self.mode == "role" and self.song:
+        if self.is_kb36():
+            tracks = [CV.TrackNotes(self.track_name or "Keyboard", self.to_convert_notes())]
+        elif self.mode == "role" and self.song:
             tracks = self.multitrack_export()
         else:
             tracks = [CV.TrackNotes(self.track_name or "Main Melody", self.to_convert_notes())]
         text_events = []
-        raw_mm = self.mode_markers or ((self.song or {}).get("mode_markers") or [])
-        if raw_mm:
-            text_events = [(float(mt), "P2_MODE:%s" % str(md))
-                           for (mt, md) in raw_mm]
+        if not self.is_kb36():
+            raw_mm = self.mode_markers or ((self.song or {}).get("mode_markers") or [])
+            if raw_mm:
+                text_events = [(float(mt), "P2_MODE:%s" % str(md))
+                               for (mt, md) in raw_mm]
         CV.write_midi(path, tracks, bpm=float(self.bpm or 120.0),
                       text_events=text_events)
         jp = None
@@ -822,31 +1216,47 @@ class PianoRollModel(object):
 
     # ── 试听合成 ────────────────────────────────────────────────────────
     @staticmethod
-    def synthesize_wav(notes, bpm=120.0, limit_sec=None):
-        """numpy 合成拨弦包络 → 标准 44100Hz / 16bit / 单声道 WAV bytes。"""
+    def synthesize_wav(notes, bpm=120.0, limit_sec=None,
+                       instrument_mode="guitar_wheel"):
+        """numpy 合成拨弦/钢琴包络 → 标准 44100Hz / 16bit / 单声道 WAV bytes。"""
         import numpy as np
         sr = 44100
         lo = 0.0
         hi = max((float(n["t"]) + max(MIN_DUR, float(n["dur"])) for n in notes),
                  default=0.5)
-        total = max(0.25, hi + 0.35)
+        is_piano = str(instrument_mode or INSTRUMENT_GUITAR_WHEEL) == INSTRUMENT_PIANO_36
+        total = max(0.25, hi + (0.28 if is_piano else 0.35))
         if limit_sec:
             total = min(total, float(limit_sec))
         buf = np.zeros(int(sr * total) + 1, dtype=np.float32)
         for n in notes:
             pitch = int(n["pitch"])
             f0 = 440.0 * (2.0 ** ((pitch - 69) / 12.0))
-            dur = max(0.09, min(float(n["dur"]), 4.0)) + 0.25
+            if is_piano:
+                dur = max(0.08, min(float(n["dur"]), 2.8)) + 0.22
+            else:
+                dur = max(0.09, min(float(n["dur"]), 4.0)) + 0.25
             cnt = min(int(sr * dur), len(buf))
             if cnt <= 0:
                 continue
             tt = np.arange(cnt, dtype=np.float32) / sr
-            env = np.exp(-tt * 5.5) * (1.0 - np.exp(-tt * 350.0))
-            wave_ = (np.sin(2 * np.pi * f0 * tt)
-                     + 0.45 * np.sin(4 * np.pi * f0 * tt)
-                     + 0.18 * np.sin(6 * np.pi * f0 * tt))
+            if is_piano:
+                # 清脆钢琴击弦起音 + 亮丽泛音 + 双指数自然衰减
+                decay = 2.8 + max(0.0, (pitch - 60) / 12.0) * 0.9
+                env = ((0.65 * np.exp(-tt * decay) + 0.35 * np.exp(-tt * (decay * 2.8)))
+                       * (1.0 - np.exp(-tt * 700.0)))
+                wave_ = (np.sin(2 * np.pi * f0 * tt)
+                         + 0.52 * np.sin(4 * np.pi * f0 * tt)
+                         + 0.24 * np.sin(6 * np.pi * f0 * tt)
+                         + 0.11 * np.sin(8 * np.pi * f0 * tt)
+                         + 0.05 * np.sin(10 * np.pi * f0 * tt))
+            else:
+                env = np.exp(-tt * 5.5) * (1.0 - np.exp(-tt * 350.0))
+                wave_ = (np.sin(2 * np.pi * f0 * tt)
+                         + 0.45 * np.sin(4 * np.pi * f0 * tt)
+                         + 0.18 * np.sin(6 * np.pi * f0 * tt))
             amp = max(0.05, min(1.0, float(n.get("vel", 80)) / 127.0))
-            seg = wave_ * env * amp * 0.26
+            seg = wave_ * env * amp * (0.24 if is_piano else 0.26)
             st = int(sr * max(0.0, float(n["t"]) - lo))
             en = min(len(buf), st + cnt)
             if en > st:
@@ -883,7 +1293,7 @@ class PianoRollCanvas(QAbstractScrollArea):
         super(PianoRollCanvas, self).__init__(parent)
         self.model = model
         self.pps = 180.0                 # 每秒像素
-        self.row_h = 13.0
+        self.row_h = 15.0 if model.is_kb36() else 13.0
         self.grid_div = 4                # 每拍切 4 份 = 1/4 拍
         self.selection = []
         self.sel_slice = None
@@ -918,7 +1328,93 @@ class PianoRollCanvas(QAbstractScrollArea):
         names = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
         return "%s%d" % (names[int(p) % 12], int(p) // 12 - 1)
 
-    # ── 坐标 ───────────────────────────────────────────────────────────
+    # ── 坐标与主题 ──────────────────────────────────────────────────────
+    def _key_w(self):
+        return KB_KEY_W if self.model.is_kb36() else KEY_W
+
+    def _is_dark(self):
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                from PyQt5.QtGui import QPalette
+                return app.palette().color(QPalette.Window).lightness() < 128
+        except Exception:
+            pass
+        return True
+
+    def _kb_palette(self):
+        if self._is_dark():
+            return {
+                "bg": QColor("#090C15"),
+                "row_white": QColor("#131A2D"),
+                "row_black": QColor("#0D1220"),
+                "row_c": QColor("#1A2440"),
+                "row_oob": QColor("#15121D"),
+                "row_oob_hatch": QColor("#251F35"),
+                "range_line": QColor("#F4C869"),
+                "grid_bar": QColor("#2B3D5C"),
+                "grid_beat": QColor("#1B2434"),
+                "grid_sub": QColor("#131A26"),
+                "ruler_bg": QColor("#111626"),
+                "ruler_bar": QColor("#4A5F86"),
+                "ruler_beat": QColor("#26324A"),
+                "ruler_txt": QColor("#CBD5E1"),
+                "ruler_sub": QColor("#64748B"),
+                "playhead": QColor("#F4C869"),
+                "kb_bg": QColor("#0D1220"),
+                "kb_white": QColor("#E2E8F0"),
+                "kb_black": QColor("#1E293B"),
+                "kb_oob": QColor("#161B29"),
+                "kb_oob_txt": QColor("#475569"),
+                "note_nat": QColor("#3B6EF5"),
+                "note_nat_bd": QColor("#93C5FD"),
+                "note_nat_txt": QColor("#F8FAFC"),
+                "note_shift": QColor("#E5A93B"),
+                "note_shift_bd": QColor("#FDE68A"),
+                "note_shift_txt": QColor("#1E1B18"),
+                "note_ctrl": QColor("#8B5CF6"),
+                "note_ctrl_bd": QColor("#DDD6FE"),
+                "note_ctrl_txt": QColor("#F8FAFC"),
+                "note_bad": QColor("#F43F5E"),
+                "note_bad_bd": QColor("#FECDD3"),
+                "note_bad_txt": QColor("#FFF1F2"),
+            }
+        return {
+            "bg": QColor("#F4F6FB"),
+            "row_white": QColor("#FFFFFF"),
+            "row_black": QColor("#F1F5FB"),
+            "row_c": QColor("#E4EDFC"),
+            "row_oob": QColor("#EAEFF7"),
+            "row_oob_hatch": QColor("#D5DEED"),
+            "range_line": QColor("#D97706"),
+            "grid_bar": QColor("#C7D4E8"),
+            "grid_beat": QColor("#E2E8F0"),
+            "grid_sub": QColor("#EEF2F9"),
+            "ruler_bg": QColor("#FFFFFF"),
+            "ruler_bar": QColor("#94A3B8"),
+            "ruler_beat": QColor("#CBD5E1"),
+            "ruler_txt": QColor("#1E293B"),
+            "ruler_sub": QColor("#64748B"),
+            "playhead": QColor("#D97706"),
+            "kb_bg": QColor("#EEF2F9"),
+            "kb_white": QColor("#FFFFFF"),
+            "kb_black": QColor("#334155"),
+            "kb_oob": QColor("#E4E9F3"),
+            "kb_oob_txt": QColor("#94A3B8"),
+            "note_nat": QColor("#3B6EF5"),
+            "note_nat_bd": QColor("#1D4ED8"),
+            "note_nat_txt": QColor("#FFFFFF"),
+            "note_shift": QColor("#E59A1A"),
+            "note_shift_bd": QColor("#B45309"),
+            "note_shift_txt": QColor("#FFFFFF"),
+            "note_ctrl": QColor("#7C3AED"),
+            "note_ctrl_bd": QColor("#5B21B6"),
+            "note_ctrl_txt": QColor("#FFFFFF"),
+            "note_bad": QColor("#E11D48"),
+            "note_bad_bd": QColor("#9F1239"),
+            "note_bad_txt": QColor("#FFFFFF"),
+        }
+
     def _duration(self):
         return max(1.0, max((n["t"] + n["dur"] for n in self.model.notes), default=1.0))
 
@@ -926,11 +1422,12 @@ class PianoRollCanvas(QAbstractScrollArea):
         self._update_scrollbars()
 
     def _update_scrollbars(self):
+        kw = self._key_w()
         vw = max(1, self.viewport().width())
         vh = max(1, self.viewport().height())
-        hmax = max(0, int(self._duration() * self.pps) + 80 - (vw - KEY_W))
+        hmax = max(0, int(self._duration() * self.pps) + 80 - (vw - kw))
         self.horizontalScrollBar().setRange(0, hmax)
-        self.horizontalScrollBar().setPageStep(max(1, vw - KEY_W))
+        self.horizontalScrollBar().setPageStep(max(1, vw - kw))
         content = (DISPLAY_HI - DISPLAY_LO + 1) * self.row_h
         vmax = max(0, int(content) - (vh - RULER_H))
         self.verticalScrollBar().setRange(0, vmax)
@@ -941,10 +1438,10 @@ class PianoRollCanvas(QAbstractScrollArea):
         self._update_scrollbars()
 
     def x_of(self, t):
-        return KEY_W + float(t) * self.pps - self.horizontalScrollBar().value()
+        return self._key_w() + float(t) * self.pps - self.horizontalScrollBar().value()
 
     def t_of(self, x):
-        return (float(x) - KEY_W + self.horizontalScrollBar().value()) / self.pps
+        return (float(x) - self._key_w() + self.horizontalScrollBar().value()) / self.pps
 
     def y_of(self, pitch):
         return RULER_H + (DISPLAY_HI - int(pitch)) * self.row_h \
@@ -982,16 +1479,25 @@ class PianoRollCanvas(QAbstractScrollArea):
 
     def _paint(self, p):
         w, h = self.viewport().width(), self.viewport().height()
-        p.fillRect(0, 0, w, h, QColor("#0b0f16"))
+        kw = self._key_w()
+        pal = self._kb_palette() if self.model.is_kb36() else None
+        p.fillRect(0, 0, w, h, pal["bg"] if pal else QColor("#0b0f16"))
         self._paint_rows(p, w, h)
         self._paint_grid(p, w, h)
         self._paint_slices(p, w)
         self._paint_notes(p, w, h)
         if self.playhead is not None:
             x = self.x_of(self.playhead)
-            if KEY_W <= x <= w:
-                p.setPen(QPen(QColor("#ffd866"), 2))
-                p.drawLine(int(x), RULER_H, int(x), h)
+            if kw - 2 <= x <= w + 2:
+                ix = int(x)
+                dark = self._is_dark()
+                # 流金高光线：外层柔光 + 核心亮线
+                glow = QColor(244, 200, 105, 72) if dark else QColor(217, 119, 6, 70)
+                core = (pal["playhead"] if pal else (QColor("#F4C869") if dark else QColor("#D97706")))
+                p.setPen(QPen(glow, 4))
+                p.drawLine(ix, RULER_H, ix, h)
+                p.setPen(QPen(core, 2))
+                p.drawLine(ix, RULER_H, ix, h)
         self._paint_ruler(p, w)
         self._paint_keyboard(p, h)
         if self._rubber is not None:
@@ -999,12 +1505,54 @@ class PianoRollCanvas(QAbstractScrollArea):
             p.setBrush(QColor(88, 166, 255, 40))
             p.drawRect(self._rubber)
 
-    def _visible_pitches(self, h):
+    def _visible_pitch_bounds(self, h):
         top = DISPLAY_HI - int(self.verticalScrollBar().value() / self.row_h)
-        return range(max(DISPLAY_LO, top), min(DISPLAY_HI, top - int(h / self.row_h) - 2), -1)
+        p_hi = min(DISPLAY_HI, top)
+        p_lo = max(DISPLAY_LO, top - int(math.ceil(h / self.row_h)) - 2)
+        return p_lo, p_hi
+
+    def _visible_pitches(self, h):
+        p_lo, p_hi = self._visible_pitch_bounds(h)
+        return range(p_hi, p_lo - 1, -1)
+
+    def _visible_time_bounds(self, w):
+        kw = self._key_w()
+        t0 = max(0.0, self.t_of(kw) - 0.05)
+        t1 = max(t0, self.t_of(w) + 0.05)
+        return t0, t1
 
     def _paint_rows(self, p, w, h):
         black = {1, 3, 6, 8, 10}
+        kw = self._key_w()
+        if self.model.is_kb36():
+            pal = self._kb_palette()
+            lo, hi = self.model.pitch_bounds()
+            row_w = max(0, w - kw)
+            row_hi = int(math.ceil(self.row_h))
+            for pitch in self._visible_pitches(h):
+                y = int(self.y_of(pitch))
+                pc = pitch % 12
+                if pitch < lo or pitch > hi:
+                    p.fillRect(kw, y, row_w, row_hi, pal["row_oob"])
+                    p.setPen(QPen(pal["row_oob_hatch"], 1))
+                    # 柔和暗纹：每 24px 画细斜纹区隔物理音域外行
+                    for hx in range(kw, w, 24):
+                        p.drawLine(hx, y + row_hi - 1, min(w, hx + row_hi), y)
+                    continue
+                col = pal["row_black"] if pc in black else pal["row_white"]
+                if pc == 0:
+                    col = pal["row_c"]
+                p.fillRect(kw, y, row_w, row_hi, col)
+            # 绘制物理音域上下边界星辉线
+            y_top = int(self.y_of(hi))
+            y_bot = int(self.y_of(lo) + self.row_h)
+            p.setPen(QPen(pal["range_line"], 1, Qt.DashLine))
+            if RULER_H <= y_top <= h:
+                p.drawLine(kw, y_top, w, y_top)
+            if RULER_H <= y_bot <= h:
+                p.drawLine(kw, y_bot, w, y_bot)
+            return
+
         for pitch in self._visible_pitches(h):
             y = self.y_of(pitch)
             pc = pitch % 12
@@ -1021,75 +1569,100 @@ class PianoRollCanvas(QAbstractScrollArea):
         beat = float(self.model.beat_sec or 0.5)
         if beat <= 1e-6:
             return
-        t = 0.0
-        dur = self._duration()
-        while t <= dur + beat:
+        kw = self._key_w()
+        pal = self._kb_palette() if self.model.is_kb36() else None
+        vis_t0, vis_t1 = self._visible_time_bounds(w)
+        dur = max(self._duration(), vis_t1)
+        idx = max(0, int(math.floor(vis_t0 / beat)))
+        t = idx * beat
+        end_t = min(dur + beat, vis_t1 + beat)
+        while t <= end_t:
             x = self.x_of(t)
-            if x < KEY_W:
-                t += beat
-                continue
             if x > w:
                 break
-            beat_idx = int(round(t / beat))
-            if beat_idx % 4 == 0:
-                p.setPen(QPen(QColor("#2b3d5c"), 1))
-            else:
-                p.setPen(QPen(QColor("#1b2434"), 1))
-            p.drawLine(int(x), RULER_H, int(x), h)
-            t += beat
+            if x >= kw:
+                if idx % 4 == 0:
+                    p.setPen(QPen(pal["grid_bar"] if pal else QColor("#2b3d5c"), 1))
+                else:
+                    p.setPen(QPen(pal["grid_beat"] if pal else QColor("#1b2434"), 1))
+                p.drawLine(int(x), RULER_H, int(x), h)
+            idx += 1
+            t = idx * beat
         if self.grid_div > 1:
             s = beat / self.grid_div
-            t = 0.0
-            p.setPen(QPen(QColor("#131a26"), 1))
-            while t <= dur:
+            sub_idx = max(0, int(math.floor(vis_t0 / s)))
+            t = sub_idx * s
+            p.setPen(QPen(pal["grid_sub"] if pal else QColor("#131a26"), 1))
+            while t <= end_t:
                 x = self.x_of(t)
-                if KEY_W <= x <= w:
+                if x > w:
+                    break
+                if x >= kw:
                     p.drawLine(int(x), RULER_H, int(x), h)
-                t += s
+                sub_idx += 1
+                t = sub_idx * s
 
     def _paint_ruler(self, p, w):
-        """顶部节拍时刻表：小节号 + 拍刻度 + 可拖动的播放指针把手。"""
-        p.fillRect(0, 0, w, RULER_H, QColor("#151c28"))
+        """顶部节拍时刻表：小节号 + 拍刻度 + 可拖动的流金星芒播放指针把手。"""
+        kw = self._key_w()
+        pal = self._kb_palette() if self.model.is_kb36() else None
+        p.fillRect(0, 0, w, RULER_H, pal["ruler_bg"] if pal else QColor("#151c28"))
         beat = float(self.model.beat_sec or 0.5)
         if beat <= 1e-6:
             return
         p.setFont(QFont("Microsoft YaHei UI", 7))
-        idx = 0
-        t = 0.0
+        vis_t0, vis_t1 = self._visible_time_bounds(w)
+        dur = max(self._duration(), vis_t1)
+        idx = max(0, int(math.floor(max(0.0, vis_t0 - beat * 4.0) / beat)))
+        t = idx * beat
         last_label_x = -999
-        dur = self._duration()
-        while t <= dur + beat:
+        end_t = min(dur + beat, vis_t1 + beat)
+        while t <= end_t:
             x = self.x_of(t)
-            if KEY_W <= x <= w:
+            if x > w + 48:
+                break
+            if kw <= x <= w:
                 is_bar = (idx % 4 == 0)
-                p.setPen(QPen(QColor("#4a5f86" if is_bar else "#26324a"), 1))
+                c_bar = pal["ruler_bar"] if pal else QColor("#4a5f86")
+                c_beat = pal["ruler_beat"] if pal else QColor("#26324a")
+                p.setPen(QPen(c_bar if is_bar else c_beat, 1))
                 p.drawLine(int(x), RULER_H - (11 if is_bar else 5), int(x), RULER_H)
                 if is_bar and (x - last_label_x) >= 18:
-                    p.setPen(QColor("#9fb3d1"))
+                    p.setPen(pal["ruler_txt"] if pal else QColor("#9fb3d1"))
                     p.drawText(QRect(int(x) + 2, 0, 52, RULER_H - 8),
                                Qt.AlignLeft | Qt.AlignVCenter,
                                "%d 小节" % (idx // 4 + 1))
-                    p.setPen(QColor("#5f7292"))
+                    p.setPen(pal["ruler_sub"] if pal else QColor("#5f7292"))
                     p.drawText(QRect(int(x) + 2, 9, 52, RULER_H - 8),
                                Qt.AlignLeft | Qt.AlignVCenter, "%.1fs" % t)
                     last_label_x = x
             idx += 1
-            t += beat
+            t = idx * beat
         if self.playhead is not None:
             x = self.x_of(self.playhead)
-            if KEY_W - 6 <= x <= w + 6:
-                p.setPen(Qt.NoPen)
-                p.setBrush(QColor("#ffd866"))
-                tri = QPolygon([QPoint(int(x) - 6, RULER_H - 2),
-                                QPoint(int(x) + 6, RULER_H - 2),
-                                QPoint(int(x), RULER_H - 12)])
-                p.drawPolygon(tri)
-                p.setPen(QPen(QColor("#ffd866"), 2))
-                p.drawLine(int(x), 0, int(x), RULER_H - 2)
+            if kw - 8 <= x <= w + 8:
+                ix = int(x)
+                dark = self._is_dark()
+                ph_col = pal["playhead"] if pal else (QColor("#F4C869") if dark else QColor("#D97706"))
+                edge_col = QColor("#FFFBEB") if dark else QColor("#FFFFFF")
+                # 星芒三角标 + 流金顶冠
+                p.setRenderHint(QPainter.Antialiasing, True)
+                p.setPen(QPen(edge_col, 1.5 if not dark else 1.0))
+                p.setBrush(ph_col)
+                star = QPolygon([
+                    QPoint(ix, 2),
+                    QPoint(ix + 6, 9),
+                    QPoint(ix + 3, 14),
+                    QPoint(ix, RULER_H - 2),
+                    QPoint(ix - 3, 14),
+                    QPoint(ix - 6, 9),
+                ])
+                p.drawPolygon(star)
+                p.setRenderHint(QPainter.Antialiasing, False)
         if self._seek_drag and self._seek_x is not None:
             txt = "%.2f s" % (max(0.0, self.t_of(self._seek_x)))
             tw = 64
-            bx = int(max(KEY_W, min(w - tw - 2, self._seek_x - tw / 2)))
+            bx = int(max(kw, min(w - tw - 2, self._seek_x - tw / 2)))
             p.setPen(Qt.NoPen)
             p.setBrush(QColor("#1f6feb"))
             p.drawRoundedRect(QRect(bx, 2, tw, 18), 4, 4)
@@ -1119,6 +1692,8 @@ class PianoRollCanvas(QAbstractScrollArea):
                 runs.append({"t": float(s["t"]), "end": float(s["end"]),
                              "hybrid": hybrid, "disp": disp, "sel": sel})
 
+        dark = self._is_dark()
+        sep_col = QColor("#1e293b") if dark else QColor("#CBD5E1")
         for r in runs:
             x1 = self.x_of(r["t"])
             x2 = self.x_of(r["end"])
@@ -1128,17 +1703,25 @@ class PianoRollCanvas(QAbstractScrollArea):
             vx2 = int(min(w, x2))
             vw = max(1, vx2 - vx1)
             if r["hybrid"]:
-                col = QColor("#155e4f") if r["sel"] else QColor("#0f3d33")
-                txt_col = QColor("#6ee7b7")
+                if dark:
+                    col = QColor("#155e4f") if r["sel"] else QColor("#0f3d33")
+                    txt_col = QColor("#6ee7b7")
+                else:
+                    col = QColor("#A7F3D0") if r["sel"] else QColor("#D1FAE5")
+                    txt_col = QColor("#065F46")
                 full_lbl = "[品格] %s" % r["disp"]
                 short_lbl = r["disp"]
             else:
-                col = QColor("#5a4218") if r["sel"] else QColor("#3b2a12")
-                txt_col = QColor("#ffd866")
+                if dark:
+                    col = QColor("#5a4218") if r["sel"] else QColor("#3b2a12")
+                    txt_col = QColor("#ffd866")
+                else:
+                    col = QColor("#FDE68A") if r["sel"] else QColor("#FEF3C7")
+                    txt_col = QColor("#92400E")
                 full_lbl = "[和弦] %s" % r["disp"]
                 short_lbl = r["disp"]
             p.fillRect(vx1, RULER_H, vw, bar_h, col)
-            p.setPen(QPen(QColor("#1e293b"), 1))
+            p.setPen(QPen(sep_col, 1))
             p.drawLine(vx1, RULER_H, vx1, RULER_H + bar_h)
             if vw >= 54:
                 p.setPen(txt_col)
@@ -1153,9 +1736,9 @@ class PianoRollCanvas(QAbstractScrollArea):
             x = self.x_of(t)
             if x < KEY_W or x > w:
                 continue
-            p.setPen(QPen(QColor("#ff5f56"), 2, Qt.DashLine))
+            p.setPen(QPen(QColor("#ff5f56") if dark else QColor("#DC2626"), 2, Qt.DashLine))
             p.drawLine(int(x), RULER_H, int(x), int(RULER_H + bar_h))
-            p.setPen(QColor("#ff8b84"))
+            p.setPen(QColor("#ff8b84") if dark else QColor("#B91C1C"))
             p.setFont(QFont("Microsoft YaHei UI", 7, QFont.Bold))
             p.drawText(QRect(int(x) + 2, RULER_H, 28, bar_h),
                        Qt.AlignLeft | Qt.AlignVCenter, "⚡Z")
@@ -1163,9 +1746,76 @@ class PianoRollCanvas(QAbstractScrollArea):
     def _paint_notes(self, p, w, h):
         if not self.model.notes:
             return
+        kw = self._key_w()
         sel = set(id(n) for n in self.selection)
+        vis_t0, vis_t1 = self._visible_time_bounds(w)
+        vis_p0, vis_p1 = self._visible_pitch_bounds(h)
+        if self.model.is_kb36():
+            pal = self._kb_palette()
+            lo, hi = self.model.pitch_bounds()
+            imode = self.model.instrument_mode
+            is_piano = (imode == INSTRUMENT_PIANO_36)
+            p.setFont(QFont("Consolas", 7, QFont.Bold))
+            for n in self.model.notes:
+                pitch = int(n["pitch"])
+                if pitch < vis_p0 or pitch > vis_p1:
+                    continue
+                nt = float(n["t"])
+                if nt > vis_t1 or (nt + float(n["dur"])) < vis_t0:
+                    continue
+                r = self.note_rect(n)
+                if r.right() < kw or r.left() > w or r.bottom() < RULER_H or r.top() > h:
+                    continue
+                oob = (pitch < lo or pitch > hi)
+                bind = None if oob else _key_binding(pitch, imode)
+                mod = bind.get("mod") if isinstance(bind, dict) else None
+                lbl = (bind.get("label") if isinstance(bind, dict) else None) or _key_label(pitch, imode)
+                if oob:
+                    fill, bd, txt_col = pal["note_bad"], pal["note_bad_bd"], pal["note_bad_txt"]
+                elif mod == "LShift":
+                    fill, bd, txt_col = pal["note_shift"], pal["note_shift_bd"], pal["note_shift_txt"]
+                elif mod == "LCtrl":
+                    fill, bd, txt_col = pal["note_ctrl"], pal["note_ctrl_bd"], pal["note_ctrl_txt"]
+                else:
+                    fill, bd, txt_col = pal["note_nat"], pal["note_nat_bd"], pal["note_nat_txt"]
+                p.setBrush(fill)
+                if id(n) in sel:
+                    p.setPen(QPen(QColor("#FFFFFF") if self._is_dark() else QColor("#0F172A"), 2))
+                elif r.width() <= 6:
+                    p.setPen(Qt.NoPen)
+                else:
+                    p.setPen(QPen(bd, 1))
+                p.drawRoundedRect(r, 3, 3)
+                # 内部顶部微光高光边，提升星曜音符块立体质感
+                if r.width() >= 10 and r.height() >= 6:
+                    p.setPen(QPen(QColor(255, 255, 255, 75), 1))
+                    p.drawLine(r.left() + 2, r.top() + 1, r.right() - 2, r.top() + 1)
+                if not is_piano and not oob and n["dur"] > float(self.model.timing.p5 or 4.0):
+                    maxx = self.x_of(n["t"] + float(self.model.timing.p5 or 4.0))
+                    p.setPen(QPen(pal["range_line"], 1, Qt.DashLine))
+                    p.drawLine(int(maxx), r.top(), int(r.right()), r.top())
+                    p.drawLine(int(maxx), r.bottom(), int(r.right()), r.bottom())
+                if oob:
+                    p.setPen(QPen(pal["note_bad_bd"], 1))
+                    for k in range(r.left() - r.height(), r.right(), 7):
+                        p.drawLine(k, r.bottom(), k + r.height(), r.top())
+                    if r.width() > 54:
+                        p.setPen(txt_col)
+                        p.drawText(r, Qt.AlignCenter, "× 越界 (%d)" % pitch)
+                elif lbl and r.width() >= 22 and self.row_h >= 11:
+                    p.setPen(txt_col)
+                    p.drawText(r.adjusted(3, 0, -2, 0), Qt.AlignLeft | Qt.AlignVCenter,
+                               lbl.replace("⌃", "^"))
+            return
+
         p.setFont(QFont("Consolas", 7))
         for n in self.model.notes:
+            pitch = int(n["pitch"])
+            if pitch < vis_p0 or pitch > vis_p1:
+                continue
+            nt = float(n["t"])
+            if nt > vis_t1 or (nt + float(n["dur"])) < vis_t0:
+                continue
             r = self.note_rect(n)
             if r.right() < KEY_W or r.left() > w or r.bottom() < RULER_H or r.top() > h:
                 continue
@@ -1237,6 +1887,96 @@ class PianoRollCanvas(QAbstractScrollArea):
                 p.drawText(r.adjusted(3, 0, -1, 0), Qt.AlignLeft | Qt.AlignVCenter, txt)
 
     def _paint_keyboard(self, p, h):
+        if self.model.is_kb36():
+            kw = self._key_w()
+            pal = self._kb_palette()
+            lo, hi = self.model.pitch_bounds()
+            imode = self.model.instrument_mode
+            dark = self._is_dark()
+            p.fillRect(0, 0, kw, h, pal["kb_bg"])
+            black = {1, 3, 6, 8, 10}
+            for pitch in self._visible_pitches(h):
+                y = int(self.y_of(pitch))
+                rh = max(4, int(self.row_h))
+                pc = pitch % 12
+                in_range = (lo <= pitch <= hi)
+                pressed = (self._pressed_pitch == pitch)
+                is_edge = (pitch == lo or pitch == hi)
+                if not in_range:
+                    p.fillRect(0, y, kw - 2, rh - 1, pal["kb_oob"])
+                    if pc == 0:
+                        p.setFont(QFont("Microsoft YaHei UI", 6))
+                        p.setPen(pal["kb_oob_txt"])
+                        p.drawText(QRect(3, y, kw - 8, rh),
+                                   Qt.AlignLeft | Qt.AlignVCenter,
+                                   "C%d" % (pitch // 12 - 1))
+                    continue
+
+                if pressed:
+                    p.fillRect(0, y, kw - 1, rh - 1, pal["note_nat"])
+                else:
+                    p.fillRect(0, y, kw - 3, rh - 1,
+                               pal["kb_black"] if pc in black else pal["kb_white"])
+                    if not dark and pc not in black:
+                        p.setPen(QPen(QColor("#D8E2F0"), 1))
+                        p.drawLine(0, y + rh - 1, kw - 4, y + rh - 1)
+
+                # 边界高亮指示条
+                if is_edge:
+                    p.fillRect(0, y, 3, rh - 1, pal["range_line"])
+
+                # 左侧音名（C音、边界音或按下时显示）
+                if pressed or is_edge or pc == 0:
+                    if pressed:
+                        txt_col = QColor("#FFFFFF")
+                    elif is_edge:
+                        txt_col = QColor("#D97706") if pc not in black else pal["range_line"]
+                    elif pc in black:
+                        txt_col = QColor("#E2E8F0")
+                    else:
+                        txt_col = QColor("#0F172A")
+                    p.setPen(txt_col)
+                    p.setFont(QFont("Microsoft YaHei UI", 6, QFont.Bold if (is_edge or pressed) else QFont.Normal))
+                    p.drawText(QRect(5, y, 34, rh),
+                               Qt.AlignLeft | Qt.AlignVCenter,
+                               self._pitch_name(pitch))
+
+                # 右侧键帽胶囊（key_label_for_pitch）
+                lbl = _key_label(pitch, imode)
+                if lbl:
+                    raw_lbl = "Ent" if lbl == "Enter" else lbl
+                    disp_lbl = raw_lbl.replace("⌃", "^")
+                    if "⇧" in raw_lbl:
+                        cap_bg = QColor("#F4C869") if dark else QColor("#FEF3C7")
+                        cap_fg = QColor("#1E1B18") if dark else QColor("#92400E")
+                        cap_bd = QColor("#FDE68A") if dark else QColor("#D97706")
+                    elif "⌃" in raw_lbl or "^" in raw_lbl:
+                        cap_bg = QColor("#7C3AED") if dark else QColor("#EDE9FE")
+                        cap_fg = QColor("#F5F3FF") if dark else QColor("#5B21B6")
+                        cap_bd = QColor("#A78BFA") if dark else QColor("#7C3AED")
+                    else:
+                        if dark:
+                            cap_bg = QColor("#1E293B")
+                            cap_fg = QColor("#E2E8F0")
+                            cap_bd = QColor("#475569")
+                        elif pc in black:
+                            cap_bg = QColor("#1E293B")
+                            cap_fg = QColor("#F8FAFC")
+                            cap_bd = QColor("#64748B")
+                        else:
+                            cap_bg = QColor("#F8FAFF")
+                            cap_fg = QColor("#1E293B")
+                            cap_bd = QColor("#B8CBEB")
+                    cap_w = 34 if len(disp_lbl) >= 3 else 26
+                    cap_r = QRect(kw - cap_w - 5, y + 1, cap_w, max(8, rh - 3))
+                    p.setBrush(cap_bg)
+                    p.setPen(QPen(cap_bd, 1))
+                    p.drawRoundedRect(cap_r, 3, 3)
+                    p.setPen(cap_fg)
+                    p.setFont(QFont("Microsoft YaHei UI", 7, QFont.Bold))
+                    p.drawText(cap_r, Qt.AlignCenter, disp_lbl)
+            return
+
         p.fillRect(0, 0, KEY_W, h, QColor("#0d1117"))
         selected = [n for n in self.selection]
         hl = set()
@@ -1316,13 +2056,15 @@ class PianoRollCanvas(QAbstractScrollArea):
                 self.scrubBegan.emit()
                 self.seekRequested.emit(self.cursor_t)
             return
-        if x < KEY_W:
+        if x < self._key_w():
             if y >= RULER_H:
-                pitch = _clamp_pitch(self.pitch_of(y))
+                pitch = self.model._clamp_pitch_mode(self.pitch_of(y))
                 self._pressed_pitch = pitch
                 self._press_timer.start()
-                self.statusChanged.emit("♪ 试听 %s（MIDI %d）"
-                                        % (self._pitch_name(pitch), pitch))
+                lbl = _key_label(pitch, self.model.instrument_mode) if self.model.is_kb36() else ""
+                tag = " [%s]" % lbl if lbl else ""
+                self.statusChanged.emit("♪ 试听 %s%s（MIDI %d）"
+                                        % (self._pitch_name(pitch), tag, pitch))
                 self.viewport().update()
                 self.noteClicked.emit({"t": 0.0, "dur": 0.15,
                                        "pitch": pitch, "vel": 100})
@@ -1361,7 +2103,7 @@ class PianoRollCanvas(QAbstractScrollArea):
             if self._seek_x > vw - 30:
                 self.horizontalScrollBar().setValue(
                     self.horizontalScrollBar().value() + 24)
-            elif self._seek_x < KEY_W + 10:
+            elif self._seek_x < self._key_w() + 10:
                 self.horizontalScrollBar().setValue(
                     max(0, self.horizontalScrollBar().value() - 24))
             self.viewport().update()
@@ -1389,7 +2131,7 @@ class PianoRollCanvas(QAbstractScrollArea):
             dp = int(round(-dy / self.row_h))
             for n, (t0, p0, _d0) in zip(self._drag["notes"], self._drag["orig"]):
                 n["t"] = round(max(0.0, self.snap(t0 + dt)), 6)
-                n["pitch"] = _clamp_pitch(p0 + dp)
+                n["pitch"] = self.model._clamp_pitch_mode(p0 + dp)
         else:
             for n, (t0, _p0, d0) in zip(self._drag["notes"], self._drag["orig"]):
                 end = self.snap(t0 + d0 + dt)
@@ -1472,7 +2214,7 @@ class PianoRollCanvas(QAbstractScrollArea):
             return
         self.cursor_t = max(0.0, self.snap(self.t_of(ev.pos().x())))
         n = self.model.add_note(self.cursor_t,
-                                _clamp_pitch(self.pitch_of(ev.pos().y())),
+                                self.model._clamp_pitch_mode(self.pitch_of(ev.pos().y())),
                                 dur=self.step_sec() or 0.25)
         self.selection = [n]
         self.commit()
@@ -1480,10 +2222,10 @@ class PianoRollCanvas(QAbstractScrollArea):
         self.viewport().update()
 
     def mouseDoubleClickEvent(self, ev):
-        if ev.pos().x() < KEY_W or ev.pos().y() < RULER_H:
+        if ev.pos().x() < self._key_w() or ev.pos().y() < RULER_H:
             return
         t = max(0.0, self.snap(self.t_of(ev.pos().x())))
-        pitch = _clamp_pitch(self.pitch_of(ev.pos().y()))
+        pitch = self.model._clamp_pitch_mode(self.pitch_of(ev.pos().y()))
         n = self.model.add_note(t, pitch, dur=self.step_sec() or 0.25)
         self.selection = [n]
         self.cursor_t = t
@@ -1533,7 +2275,7 @@ class PianoRollCanvas(QAbstractScrollArea):
         anchor = self.t_of(x)
         self.pps = max(18.0, min(900.0, self.pps * factor))
         self._update_scrollbars()
-        newx = KEY_W + anchor * self.pps - self.horizontalScrollBar().value()
+        newx = self._key_w() + anchor * self.pps - self.horizontalScrollBar().value()
         self.horizontalScrollBar().setValue(
             int(self.horizontalScrollBar().value() + (newx - x)))
         self.statusChanged.emit("时间缩放：%.0f 像素/秒" % self.pps)
@@ -1568,7 +2310,7 @@ class PianoRollCanvas(QAbstractScrollArea):
         ev.accept()
 
     def commit(self, keep_undo=False):
-        if self.model.mode == "role":
+        if self.model.mode == "role" or self.model.is_kb36():
             self.model.compile()
         self.statusChanged.emit(self.model.status_text())
         self.editCommitted.emit()
@@ -1576,7 +2318,7 @@ class PianoRollCanvas(QAbstractScrollArea):
 
     def zoom_fit(self):
         self._update_scrollbars()
-        cw = max(1, self.viewport().width() - KEY_W)
+        cw = max(1, self.viewport().width() - self._key_w())
         self.pps = max(45.0, min(900.0, (cw - 60) / self._duration()))
         self._update_scrollbars()
         self.viewport().update()
@@ -1584,9 +2326,13 @@ class PianoRollCanvas(QAbstractScrollArea):
     def center_on_notes(self):
         """把纵向滚动条对准音符的中位音高。"""
         if not self.model.notes:
-            return
-        pitches = sorted(int(n["pitch"]) for n in self.model.notes)
-        med = pitches[len(pitches) // 2]
+            if not self.model.is_kb36():
+                return
+            lo, hi = self.model.pitch_bounds()
+            med = (lo + hi) // 2
+        else:
+            pitches = sorted(int(n["pitch"]) for n in self.model.notes)
+            med = pitches[len(pitches) // 2]
         vh = max(1, self.viewport().height() - RULER_H)
         content = (DISPLAY_HI - DISPLAY_LO + 1) * self.row_h
         want = (DISPLAY_HI - med) * self.row_h - vh / 2.0
@@ -1601,9 +2347,17 @@ class PianoRollCanvas(QAbstractScrollArea):
 class PianoRollDialog(QDialog):
     """卷帘主窗口：工具栏 + 画布 + 状态栏。"""
 
-    def __init__(self, path=None, role=None, parent=None, on_apply=None):
+    def __init__(self, path=None, role=None, parent=None, on_apply=None,
+                 instrument_mode="guitar_wheel", kb_track_scope="all", transpose=0,
+                 kb_arrange_mode="raw", kb_arrange_opts=None):
         super(PianoRollDialog, self).__init__(parent)
-        self.setWindowTitle("《异键演奏》钢琴卷帘微调")
+        imode = str(instrument_mode or INSTRUMENT_GUITAR_WHEEL)
+        if imode == INSTRUMENT_GUITAR_36:
+            self.setWindowTitle("《异键演奏》钢琴卷帘 · 吉他 36 键 (E3~D#6)")
+        elif imode == INSTRUMENT_PIANO_36:
+            self.setWindowTitle("《异键演奏》钢琴卷帘 · 钢琴 36 键 (C4~B6)")
+        else:
+            self.setWindowTitle("《异键演奏》钢琴卷帘微调")
         avail = QApplication.desktop().availableGeometry(self)
         self.resize(min(1280, int(avail.width() * 0.94)),
                     min(760, int(avail.height() * 0.88)))
@@ -1623,7 +2377,14 @@ class PianoRollDialog(QDialog):
         self._want_play = False
         self._pending_seek_ms = 0
         self._init_player()
-        self.model = PianoRollModel(path, role=role)
+        self.model = PianoRollModel(
+            path, role=role,
+            instrument_mode=imode,
+            kb_track_scope=kb_track_scope,
+            transpose=transpose,
+            kb_arrange_mode=kb_arrange_mode,
+            kb_arrange_opts=kb_arrange_opts,
+        )
         self.canvas = PianoRollCanvas(self.model, self)
         self.canvas.selectionChanged.connect(self._on_selection)
         self.canvas.statusChanged.connect(self._set_status)
@@ -1642,7 +2403,7 @@ class PianoRollDialog(QDialog):
         self._refresh_buttons()
         self._sync_play_button()
         self._set_status(self.model.status_text())
-        self._role_mode = bool(role)
+        self._role_mode = bool(role) and not self.model.is_kb36()
 
     def _init_player(self):
         try:
@@ -1670,11 +2431,35 @@ class PianoRollDialog(QDialog):
             pass
 
     # ── UI ─────────────────────────────────────────────────────────────
-    def _btn(self, text, tip, slot, obj=None):
+    def _icon_color(self):
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                from PyQt5.QtGui import QPalette
+                if app.palette().color(QPalette.Window).lightness() >= 128:
+                    return "#1E293B"
+        except Exception:
+            pass
+        return "#E6EDF7"
+
+    def _apply_icon(self, btn, icon_name, color=None, size=14):
+        if _make_vector_icon is None or btn is None:
+            return
+        try:
+            btn.setIcon(_make_vector_icon(icon_name, color=color or self._icon_color(), size=size))
+            btn.setIconSize(QSize(size, size))
+        except Exception as exc:  # noqa: BLE001
+            _log_exc("piano_roll icon skipped (%s)" % icon_name, exc)
+
+    def _btn(self, text, tip, slot, obj=None, icon_name=None, icon_color=None, compact=False):
         b = QPushButton(text)
         b.setToolTip(tip)
         if obj:
             b.setObjectName(obj)
+        if compact:
+            b.setStyleSheet("padding: 4px 10px;")
+        if icon_name:
+            self._apply_icon(b, icon_name, color=icon_color, size=14)
         b.clicked.connect(slot)
         return b
 
@@ -1685,14 +2470,17 @@ class PianoRollDialog(QDialog):
 
         row = QHBoxLayout()
         row.setSpacing(4)
-        self.btn_open = self._btn("打开 MIDI…", "打开任意阶段 MIDI", self.open_file)
+        self.btn_open = self._btn("打开 MIDI…", "打开任意阶段 MIDI", self.open_file,
+                                  icon_name="folder", compact=True)
         self.btn_open.setVisible(False)
         self.btn_save = self._btn("保存覆盖原 MIDI", "写回原文件，并同步同名 .json",
-                                  self.save_over)
+                                  self.save_over, compact=True)
         self.btn_save_as = self._btn("另存为新 MIDI", "另存为；若同目录有同名 .json 也一并写",
-                                     self.save_as)
-        self.btn_undo = self._btn("↶ 撤销", "Ctrl+Z", self.undo)
-        self.btn_redo = self._btn("↷ 重做", "Ctrl+Y", self.redo)
+                                     self.save_as, compact=True)
+        self.btn_undo = self._btn("撤销" if _make_vector_icon else "← 撤销", "Ctrl+Z",
+                                  self.undo, icon_name="undo", compact=True)
+        self.btn_redo = self._btn("重做" if _make_vector_icon else "→ 重做", "Ctrl+Y",
+                                  self.redo, icon_name="redo", compact=True)
         for b in (self.btn_open, self.btn_save, self.btn_save_as, self.btn_undo, self.btn_redo):
             row.addWidget(b)
         row.addSpacing(12)
@@ -1711,15 +2499,16 @@ class PianoRollDialog(QDialog):
         row.addWidget(self.cmb_grid)
         row.addStretch(1)
         self.btn_fix = self._btn("归位 40~88", "调用 pipeline.fix_pitch_range 做音域归位",
-                                 self.fix_range)
+                                 self.fix_range, compact=True)
         self.cmb_inst = QComboBox()
         self.cmb_inst.addItem("木吉他", "acoustic")
         self.cmb_inst.addItem("电吉他", "electric")
         self.cmb_inst.setMinimumWidth(96)
         self.btn_restore = self._btn("恢复默认编配", "清除手动微调，重新走 adapt_song",
-                                     self.restore_auto)
+                                     self.restore_auto, icon_name="refresh", compact=True)
         self.btn_apply = self._btn("应用微调", "应用微调并更新演奏台：直通重编后把时间轴送回演奏页",
-                                   self.apply_custom, obj="primary")
+                                   self.apply_custom, obj="primary",
+                                   icon_name="check", icon_color="#FFFFFF", compact=True)
         for b in (self.btn_fix, self.cmb_inst, self.btn_restore, self.btn_apply):
             row.addWidget(b)
         root.addLayout(row)
@@ -1729,8 +2518,11 @@ class PianoRollDialog(QDialog):
 
         row2 = QHBoxLayout()
         row2.setSpacing(8)
-        self.btn_play = self._btn("▶ 试听", "空格：播放/暂停；也可用底部滑块或顶部节拍表拖动", self.preview)
-        self.btn_stop = self._btn("⏹ 停止", "停止试听", self.stop_preview)
+        self.btn_play = self._btn("试听" if _make_vector_icon else "▶ 试听",
+                                  "空格：播放/暂停；也可用底部滑块或顶部节拍表拖动",
+                                  self.preview, icon_name="play")
+        self.btn_stop = self._btn("停止" if _make_vector_icon else "× 停止",
+                                  "停止试听", self.stop_preview, icon_name="stop")
         row2.addWidget(self.btn_play)
         row2.addWidget(self.btn_stop)
         row2.addWidget(QLabel("音量:"))
@@ -1763,6 +2555,33 @@ class PianoRollDialog(QDialog):
             "模式 A 下勾选：按 1P 主音真实编译，显示 S弦F品·P页 角标、丢弃与晚出预警")
         self.chk_phys_preview.toggled.connect(self._toggle_phys_preview)
         row2.addWidget(self.chk_phys_preview)
+
+        # v1.4：36 键专用第 2 行控件（仅 guitar_36 / piano_36 显示，第 1 行不增控件）
+        self.lbl_kb_transpose = QLabel("移调:")
+        self.spin_kb_transpose = QSpinBox()
+        self.spin_kb_transpose.setRange(-12, 12)
+        self.spin_kb_transpose.setValue(int(self.model.transpose or 0))
+        self.spin_kb_transpose.setFixedWidth(64)
+        self.spin_kb_transpose.setToolTip("全曲半音移调 (-12 ~ +12)")
+        self.spin_kb_transpose.valueChanged.connect(self._on_kb_transpose_changed)
+        self.btn_kb_auto_shift = self._btn(
+            "智能移调", "计算当前音域命中率最高的最佳半音移调",
+            self._on_kb_auto_transpose, icon_name="spark",
+        )
+        self.lbl_kb_coverage = QLabel("覆盖率: --")
+        self.lbl_kb_coverage.setObjectName("sub")
+        self.btn_kb_map = self._btn(
+            "36键位图", "打开当前 36 键交互式键位分布图",
+            self._open_kb_preview, icon_name="keyboard",
+        )
+        self._kb_widgets = (
+            self.lbl_kb_transpose, self.spin_kb_transpose,
+            self.btn_kb_auto_shift, self.lbl_kb_coverage, self.btn_kb_map,
+        )
+        for w in self._kb_widgets:
+            w.setVisible(False)
+            row2.addWidget(w)
+
         row2.addStretch(1)
 
         self.lbl_chord = QLabel("切片和弦:")
@@ -1828,6 +2647,53 @@ class PianoRollDialog(QDialog):
     def _fill_tracks(self):
         self.cmb_track.blockSignals(True)
         self.cmb_track.clear()
+        if self.model.is_kb36():
+            self.lbl_track.setText("36 键编配：")
+            for label, tag in (
+                ("原谱：全部音轨合弹", "raw:all"),
+                ("原谱：仅主旋律", "raw:melody"),
+                ("原谱：仅伴奏与和声", "raw:accomp"),
+                ("编配：1P 独奏(旋律+伴奏)", "arr:solo"),
+                ("编配：1P 主音(纯旋律)", "arr:duet_lead"),
+                ("编配：2P 柱式律动", "arr:duet_rhythm"),
+                ("编配：2P 错峰扫弦", "arr:duet_rhythm_strum"),
+                ("编配：2P 琶音/根音", "arr:duet_rhythm_fret"),
+            ):
+                self.cmb_track.addItem(label, tag)
+            am = str(getattr(self.model, "kb_arrange_mode", "raw") or "raw")
+            aopts = getattr(self.model, "kb_arrange_opts", None) or {}
+            if am == "raw":
+                cur_tag = "raw:%s" % self.model.kb_track_scope
+            elif am == "duet_rhythm" and aopts.get("kb_strum_roll"):
+                cur_tag = "arr:duet_rhythm_strum"
+            else:
+                cur_tag = "arr:%s" % am
+            idx = self.cmb_track.findData(cur_tag)
+            self.cmb_track.setCurrentIndex(max(0, idx))
+            self.cmb_track.setEnabled(True)
+            self.cmb_track.blockSignals(False)
+            lo, hi = self.model.pitch_bounds()
+            self.btn_fix.setText("归位 %d~%d" % (lo, hi))
+            self.btn_fix.setVisible(True)
+            self.cmb_inst.setVisible(False)
+            try:
+                self.chk_phys_preview.setVisible(False)
+            except Exception:
+                pass
+            self.btn_restore.setVisible(True)
+            self.btn_apply.setVisible(True)
+            for w in (self.chk_roll_arp, self.chk_roll_rhythm, self.chk_strum_mode):
+                w.setVisible(False)
+            for w in getattr(self, "_kb_widgets", ()):
+                w.setVisible(True)
+            self._refresh_kb_coverage()
+            self._update_legend()
+            self._update_switch_availability()
+            return
+
+        for w in getattr(self, "_kb_widgets", ()):
+            w.setVisible(False)
+        self.btn_fix.setText("归位 40~88")
         if self.model.mode == "midi":
             self.lbl_track.setText("轨道：")
             for i, tr in enumerate(self.model.tracks):
@@ -1863,13 +2729,66 @@ class PianoRollDialog(QDialog):
             w.setVisible(self.model.mode == "role")
 
     def _chord_widgets_visible(self, on):
-        show_bar = bool(on) and self.model.mode == "role"
+        show_bar = bool(on) and self.model.mode == "role" and not self.model.is_kb36()
         for w in (self.lbl_chord, self.cmb_chord, self.btn_chord,
                   self.cmb_string, self.btn_pluck):
             w.setVisible(show_bar)
         # 角色 3（2P 琶音/根音）全程纯拨弦 0 鼠标扫弦，仅在角色 4（柱式/扫弦）下显示添加扫弦按钮
         self.btn_strum_d.setVisible(show_bar and self.model.role == MC.ROLE_DUET_RHYTHM)
         self.btn_strum_u.setVisible(False)
+
+    def _refresh_kb_coverage(self):
+        if not self.model.is_kb36() or not hasattr(self, "lbl_kb_coverage"):
+            return
+        info = self.model.kb_coverage_info()
+        pct = float(info.get("coverage") or 0.0) * 100.0
+        self.lbl_kb_coverage.setText("音域覆盖: %.0f%% (%d/%d)" % (
+            pct, int(info.get("in_range") or 0), int(info.get("total") or 0)))
+
+    def _on_kb_transpose_changed(self, val):
+        if not self.model.is_kb36():
+            return
+        if self.model.set_kb_transpose(val):
+            self.canvas.selection = []
+            self._refresh_kb_coverage()
+            self._refresh_buttons()
+            self.canvas.center_on_notes()
+            self.canvas.viewport().update()
+            self._invalidate_audio_preview()
+
+    def _on_kb_auto_transpose(self):
+        if not self.model.is_kb36():
+            return
+        shift = self.model.auto_kb_transpose()
+        self.spin_kb_transpose.blockSignals(True)
+        self.spin_kb_transpose.setValue(int(shift))
+        self.spin_kb_transpose.blockSignals(False)
+        self.canvas.selection = []
+        self._refresh_kb_coverage()
+        self._refresh_buttons()
+        self.canvas.center_on_notes()
+        self.canvas.viewport().update()
+        self._invalidate_audio_preview()
+
+    def _open_kb_preview(self):
+        if not self.model.is_kb36():
+            return
+        try:
+            from keyboard_preview import KeyboardPreviewDialog
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.information(self, "键位图暂未就绪", "无法加载 36 键位图：%s" % exc)
+            return
+        used = {}
+        for n in self.model.notes:
+            p = int(n["pitch"])
+            used[p] = used.get(p, 0) + 1
+        dlg = KeyboardPreviewDialog(
+            instrument_mode=self.model.instrument_mode,
+            used_pitches=used,
+            transpose=self.model.transpose,
+            parent=self,
+        )
+        dlg.exec_()
 
     def _on_roll_flags_changed(self, _checked=None):
         """卷帘内切换琶音 / 扫弦律动：写回配置并实时重算 2P 与 Solo。"""
@@ -1879,7 +2798,6 @@ class PianoRollDialog(QDialog):
         rhythm = self.chk_roll_rhythm.isChecked()
         if (arp, rhythm) == self.model.roll_flags():
             return
-        self.model._snapshot()
         self.model.rebuild_for_flags(arp, rhythm)
         self.canvas.selection = []
         self._chord_widgets_visible(self.model.kind == "chord")
@@ -1896,7 +2814,6 @@ class PianoRollDialog(QDialog):
         on = self.chk_strum_mode.isChecked()
         if on == self.model.roll_strum_mode():
             return
-        self.model._snapshot()
         self.model.rebuild_for_strum_mode(on)
         self.canvas.selection = []
         self._chord_widgets_visible(self.model.kind == "chord")
@@ -1935,10 +2852,26 @@ class PianoRollDialog(QDialog):
                 pass
 
     def _update_legend(self):
-        """按当前角色刷新颜色图例（右下角常驻）。"""
-        blue = "<span style='color:#2563eb'>■</span>"
-        green = "<span style='color:#16a34a'>■</span>"
-        red = "<span style='color:#dc2626'>■</span>"
+        """按当前角色或 36 键模式刷新颜色图例（右下角常驻）。"""
+        if self.model.is_kb36():
+            blue = "<span style='color:#3B6EF5'>●</span>"
+            gold = "<span style='color:#E5A93B'>●</span>"
+            violet = "<span style='color:#8B5CF6'>●</span>"
+            red = "<span style='color:#F43F5E'>●</span>"
+            if self.model.instrument_mode == INSTRUMENT_PIANO_36:
+                body = "%s自然音  %s⇧Shift升号  %s^Ctrl降号  %s越界不可弹" % (
+                    blue, gold, violet, red)
+            else:
+                body = "%s可弹音符(支持延音)  %s越界不可弹" % (blue, red)
+            try:
+                self.lbl_legend.setText("图例：" + body)
+            except Exception:
+                pass
+            return
+
+        blue = "<span style='color:#2563eb'>●</span>"
+        green = "<span style='color:#16a34a'>●</span>"
+        red = "<span style='color:#dc2626'>●</span>"
         amber = "<span style='color:#d97706'>□</span>"
         role = self.model.role if self.model.mode == "role" else None
         if role == MC.ROLE_SOLO:
@@ -2026,9 +2959,11 @@ class PianoRollDialog(QDialog):
 
     def _check_can_save_or_apply(self, show_dialog=True):
         """红色非法音符硬拦截；返回 True 才允许保存/应用。"""
-        if self.model.mode != "role" and not self.chk_phys_preview.isChecked():
+        if self.model.is_kb36():
+            _ok, bad = self.model.save_guard()
+        elif self.model.mode != "role" and not self.chk_phys_preview.isChecked():
             return True
-        if self.model.mode == "role":
+        elif self.model.mode == "role":
             _ok, bad = self.model.save_guard()
         else:
             if self.chk_phys_preview.isChecked():
@@ -2075,6 +3010,27 @@ class PianoRollDialog(QDialog):
         self.canvas.grid_div = int(self.cmb_grid.currentData() or 0)
 
     def _switch_track(self, _idx):
+        if self.model.is_kb36():
+            tag = str(self.cmb_track.currentData() or "")
+            changed = False
+            if tag.startswith("raw:"):
+                changed = self.model.set_kb_scope(tag.split(":", 1)[1])
+            elif tag == "arr:duet_rhythm_strum":
+                changed = self.model.set_kb_arrange("duet_rhythm", {"kb_strum_roll": True})
+            elif tag == "arr:duet_rhythm":
+                changed = self.model.set_kb_arrange("duet_rhythm", {"kb_strum_roll": False})
+            elif tag.startswith("arr:"):
+                changed = self.model.set_kb_arrange(tag.split(":", 1)[1])
+            elif tag:
+                changed = self.model.set_kb_scope(tag)
+            if changed:
+                self.canvas.selection = []
+                self._refresh_kb_coverage()
+                self._refresh_buttons()
+                self.canvas.center_on_notes()
+                self.canvas.viewport().update()
+                self._invalidate_audio_preview()
+            return
         if self.model.mode == "role":
             role = self.cmb_track.currentData()
             if role and role != self.model.role and self.model.switch_role(role):
@@ -2181,6 +3137,13 @@ class PianoRollDialog(QDialog):
             return
         self.canvas.selection = []
         self.canvas.commit()
+        if self.model.is_kb36():
+            lo, hi = self.model.pitch_bounds()
+            self._refresh_kb_coverage()
+            self._set_status("已归位至 %d~%d：边界折断 %d，孤立修正 %d"
+                             % (lo, hi, st.get("boundary_folded", 0),
+                                st.get("isolated_fixed", 0)))
+            return
         self._set_status("已按%s规则归位：整轨 -%d 半音，孤立修正 %d，边界折断 %d"
                          % ("木吉他" if mode == "acoustic" else "电吉他",
                             st.get("global_down_octaves", 0) * 12,
@@ -2188,7 +3151,7 @@ class PianoRollDialog(QDialog):
                             st.get("boundary_folded", 0)))
 
     def restore_auto(self):
-        if self.model.mode != "role":
+        if self.model.mode != "role" and not self.model.is_kb36():
             return
         if QMessageBox.question(self, "恢复自动编配",
                                 "清除手动微调、恢复自动生成？") != QMessageBox.Yes:
@@ -2202,11 +3165,12 @@ class PianoRollDialog(QDialog):
                 pass
         self.canvas.selection = []
         self.canvas.commit()
+        self._refresh_kb_coverage()
         self._refresh_buttons()
         self._invalidate_audio_preview()
 
     def apply_custom(self):
-        if self.model.mode != "role":
+        if self.model.mode != "role" and not self.model.is_kb36():
             QMessageBox.information(self, "仅角色模式", "请从演奏页打开钢琴卷帘。")
             return
         if not self._check_can_save_or_apply():
@@ -2264,7 +3228,10 @@ class PianoRollDialog(QDialog):
         try:
             with open(path, "wb") as f:
                 f.write(data)
-            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            winsound.PlaySound(
+                path,
+                winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+            )
             self._wav_path = path
             self._wav = data
         except Exception:
@@ -2307,8 +3274,10 @@ class PianoRollDialog(QDialog):
             one = dict(note)
             one["dur"] = 0.15
             one["t"] = 0.0
-            data = PianoRollModel.synthesize_wav([one], self.model.bpm,
-                                                 limit_sec=0.22)
+            data = PianoRollModel.synthesize_wav(
+                [one], self.model.bpm, limit_sec=0.22,
+                instrument_mode=self.model.instrument_mode,
+            )
             self._play_wav(data)
             self._set_status("♪ %s（MIDI %d）—— 150ms 试听"
                              % (name, int(note["pitch"])))
@@ -2333,7 +3302,10 @@ class PianoRollDialog(QDialog):
 
     def preview_wav_bytes(self):
         """当前画布音符对应的试听 WAV 字节流（不落盘）。"""
-        return PianoRollModel.synthesize_wav(self.model.notes, self.model.bpm)
+        return PianoRollModel.synthesize_wav(
+            self.model.notes, self.model.bpm,
+            instrument_mode=self.model.instrument_mode,
+        )
 
     def _build_audio(self):
         if self.player is None or self._QMediaContent is None:
@@ -2447,11 +3419,14 @@ class PianoRollDialog(QDialog):
         if not hasattr(self, "btn_play"):
             return
         if self._playing:
-            self.btn_play.setText("⏸ 暂停（空格）")
+            self.btn_play.setText("暂停（空格）" if _make_vector_icon else "|| 暂停（空格）")
+            self._apply_icon(self.btn_play, "pause")
         elif self._paused:
-            self.btn_play.setText("▶ 继续（空格）")
+            self.btn_play.setText("继续（空格）" if _make_vector_icon else "▶ 继续（空格）")
+            self._apply_icon(self.btn_play, "play")
         else:
-            self.btn_play.setText("▶ 试听当前谱面")
+            self.btn_play.setText("试听当前谱面" if _make_vector_icon else "▶ 试听当前谱面")
+            self._apply_icon(self.btn_play, "play")
 
     def keyPressEvent(self, ev):
         if ev.key() == Qt.Key_Space and ev.modifiers() == Qt.NoModifier:
@@ -2477,7 +3452,10 @@ class PianoRollDialog(QDialog):
         start = max(0.0, float(self.canvas.playhead or 0.0))
         if self.player is None:
             try:
-                data = PianoRollModel.synthesize_wav(self.model.notes, self.model.bpm)
+                data = PianoRollModel.synthesize_wav(
+                    self.model.notes, self.model.bpm,
+                    instrument_mode=self.model.instrument_mode,
+                )
                 self._play_wav(data)
                 self._t0 = time.perf_counter()
                 self._audio_duration = self._notes_end()
@@ -2593,6 +3571,12 @@ class PianoRollDialog(QDialog):
             self._update_progress(self.canvas.playhead or 0.0)
         if self.model.mode == "midi" and self.model.phys_enabled:
             self._compile_phys()
+        if self.model.is_kb36():
+            if hasattr(self, "spin_kb_transpose") and self.spin_kb_transpose.value() != int(self.model.transpose):
+                self.spin_kb_transpose.blockSignals(True)
+                self.spin_kb_transpose.setValue(int(self.model.transpose))
+                self.spin_kb_transpose.blockSignals(False)
+            self._refresh_kb_coverage()
 
     def _tick(self):
         try:
@@ -2632,13 +3616,25 @@ class PianoRollDialog(QDialog):
             self.canvas.horizontalScrollBar().setValue(
                 int(self.canvas.horizontalScrollBar().value() + (x - (vw - 60))))
 
-    def closeEvent(self, ev):
+    def _shutdown_preview_resources(self):
         self.stop_preview()
         self._cleanup_audio()
         try:
             self._stop_wav()
         except Exception:
             pass
+        try:
+            if getattr(self, "canvas", None) is not None and hasattr(self.canvas, "_press_timer"):
+                self.canvas._press_timer.stop()
+        except Exception:
+            pass
+
+    def reject(self):
+        self._shutdown_preview_resources()
+        super(PianoRollDialog, self).reject()
+
+    def closeEvent(self, ev):
+        self._shutdown_preview_resources()
         super(PianoRollDialog, self).closeEvent(ev)
 
 

@@ -30,14 +30,19 @@ _QT_PLUGINS = Path(sys.prefix) / "Lib" / "site-packages" / "PyQt5" / "Qt5" / "pl
 if _QT_PLUGINS.is_dir() and not os.environ.get("QT_PLUGIN_PATH"):
     os.environ["QT_PLUGIN_PATH"] = str(_QT_PLUGINS)
 
-from PyQt5.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QFont, QTextCursor
+from PyQt5.QtCore import QObject, QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtGui import QFont, QIcon, QTextCursor
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QSizePolicy, QSpinBox, QTabWidget, QVBoxLayout,
     QWidget,
 )
+
+try:
+    import ui_widgets as UW
+except Exception:
+    UW = None
 
 HERE = Path(__file__).resolve().parent
 PROJECT_DIR = HERE.parent
@@ -192,14 +197,52 @@ class MainWindow(QMainWindow):
         self.log(f"配置文件：{pipeline.config_file()}")
 
     # ------------------------------------------------------------------ UI
+    def _make_card(self) -> QFrame:
+        if UW is not None and hasattr(UW, "GlassCard"):
+            return UW.GlassCard()
+        card = QFrame()
+        card.setObjectName("card")
+        return card
+
+    def _build_ai_banner(self) -> QWidget:
+        if UW is not None and hasattr(UW, "HeroBannerWidget"):
+            banner = UW.HeroBannerWidget("ai", height=112)
+            lay = banner.content_layout()
+        else:
+            banner = self._make_card()
+            lay = QHBoxLayout(banner)
+            lay.setContentsMargins(16, 12, 16, 12)
+        left = QVBoxLayout()
+        left.setSpacing(5)
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
+        lbl_t = QLabel("AI 智能扒谱 · 音频转 MIDI")
+        lbl_t.setObjectName("heroTitle")
+        title_row.addWidget(lbl_t)
+        self.hero_dev_pill = QLabel("正在探测设备…")
+        self.hero_dev_pill.setObjectName("accentPill")
+        title_row.addWidget(self.hero_dev_pill)
+        title_row.addStretch(1)
+        left.addLayout(title_row)
+        lbl_sub = QLabel("SheetSage2 音频智能转录 · 声部对齐合并 · 音域自动修正")
+        lbl_sub.setObjectName("heroSub")
+        left.addWidget(lbl_sub)
+        lay.addLayout(left, 1)
+        # 右侧留出 >= 280px 安全区，避免文字或徽章遮挡星环视觉主体
+        lay.addSpacing(280)
+        return banner
+
     def _build_ui(self) -> None:
         """项目组 单屏三区工作台（不再用 ①②③ 标签页藏参数）。"""
         root = QWidget()
+        root.setObjectName("stagePage")
         self.setCentralWidget(root)
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(14, 12, 14, 12)
+        outer.setContentsMargins(10, 8, 10, 10)
         outer.setSpacing(10)
 
+        self._ai_banner = self._build_ai_banner()
+        outer.addWidget(self._ai_banner, 0)
         outer.addWidget(self._build_inputs_card(), 0)
         self._pipeline_card = self._build_pipeline_row()
         outer.addWidget(self._pipeline_card, 0)
@@ -211,6 +254,34 @@ class MainWindow(QMainWindow):
         for name in ("① 音频转录", "② 对齐合并", "③ 修正导出"):
             self.tabs.addTab(QWidget(self), name)
         self.tabs.hide()
+        self.on_theme_changed(self._cur_theme_mode())
+
+    def _cur_theme_mode(self) -> str:
+        try:
+            pal = QApplication.palette()
+            return "light" if pal.window().color().lightness() >= 128 else "dark"
+        except Exception:
+            return "dark"
+
+    def on_theme_changed(self, mode: str) -> None:
+        norm = "light" if str(mode).lower() == "light" else "dark"
+        if hasattr(self, "_ai_banner") and hasattr(self._ai_banner, "set_theme_mode"):
+            self._ai_banner.set_theme_mode(norm)
+        if UW is None:
+            return
+        fg = "#CBD5E1" if norm == "dark" else "#334155"
+        for attr, icon_name, col in (
+            ("btn_run_all", "play", "#FFFFFF"),
+            ("btn_stop", "stop", "#F43F5E" if norm == "dark" else "#E11D48"),
+            ("btn_open_out", "folder", fg),
+            ("btn_roll_final", "roll", fg),
+            ("btn_send", "guitar", fg),
+            ("btn_open_sep", "folder", fg),
+        ):
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btn.setIcon(UW.make_vector_icon(icon_name, col, 16))
+                btn.setIconSize(QSize(16, 16))
 
     def _mini_label(self, text, width=96, obj="fieldname"):
         lab = QLabel(text)
@@ -220,13 +291,12 @@ class MainWindow(QMainWindow):
         return lab
 
     def _build_inputs_card(self) -> QFrame:
-        card = QFrame()
-        card.setObjectName("card")
+        card = self._make_card()
         v = QVBoxLayout(card)
         v.setContentsMargins(14, 12, 14, 12)
         v.setSpacing(7)
 
-        title = QLabel("音频转 MIDI（AI 智能扒谱）")
+        title = QLabel("输入与参数配置")
         title.setObjectName("cardtitle")
         v.addWidget(title)
 
@@ -276,16 +346,44 @@ class MainWindow(QMainWindow):
         self.s3_instrument.setMinimumWidth(150)
         grid.addWidget(self.s3_instrument, 1, 1, 1, 3)
 
+        grid.addWidget(self._mini_label("有效音域", 84), 2, 0)
+        row_range = QHBoxLayout()
+        row_range.setSpacing(6)
         self.s3_low = QSpinBox(card)
         self.s3_low.setRange(0, 127)
         self.s3_low.setValue(40)
-        self.s3_low.setVisible(False)
+        self.s3_low.setFixedWidth(68)
+        self.s3_low.setToolTip("最低 MIDI 音高（吉他轮盘 40 / 吉他36键 52 / 钢琴36键 60）")
         self.s3_high = QSpinBox(card)
         self.s3_high.setRange(0, 127)
         self.s3_high.setValue(88)
-        self.s3_high.setVisible(False)
+        self.s3_high.setFixedWidth(68)
+        self.s3_high.setToolTip("最高 MIDI 音高（吉他轮盘 88 / 吉他36键 87 / 钢琴36键 95）")
+        row_range.addWidget(self.s3_low)
+        lbl_tilde = QLabel("~")
+        lbl_tilde.setObjectName("sub")
+        row_range.addWidget(lbl_tilde)
+        row_range.addWidget(self.s3_high)
+        row_range.addSpacing(6)
+        self._range_presets = []
+        for label, lo, hi in (
+            ("吉他轮盘 40~88", 40, 88),
+            ("吉他36键 52~87", 52, 87),
+            ("钢琴36键 60~95", 60, 95),
+        ):
+            btn = QPushButton(label)
+            btn.setObjectName("modePill")
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda _=False, a=lo, b=hi: self._apply_range_preset(a, b))
+            row_range.addWidget(btn)
+            self._range_presets.append((btn, lo, hi))
+        row_range.addStretch(1)
+        self.s3_low.valueChanged.connect(self._sync_range_presets)
+        self.s3_high.valueChanged.connect(self._sync_range_presets)
+        self._sync_range_presets()
+        grid.addLayout(row_range, 2, 1, 1, 3)
 
-        grid.addWidget(self._mini_label("扒谱声部", 84), 2, 0)
+        grid.addWidget(self._mini_label("扒谱声部", 84), 3, 0)
         row_stem = QHBoxLayout()
         row_stem.setSpacing(12)
         self.chk_vocal = QCheckBox("人声主旋律")
@@ -306,7 +404,7 @@ class MainWindow(QMainWindow):
         self.btn_open_sep.clicked.connect(self._open_temp_sep)
         row_stem.addWidget(self.btn_open_sep)
         row_stem.addStretch(1)
-        grid.addLayout(row_stem, 2, 1, 1, 3)
+        grid.addLayout(row_stem, 3, 1, 1, 3)
 
         # 单模型管线固定按“时长更长优先”合并；控件保留但不显示，兼容旧设置
         self.s2_mode = QComboBox()
@@ -316,7 +414,7 @@ class MainWindow(QMainWindow):
         grid.setColumnStretch(3, 1)
         v.addLayout(grid)
 
-        self.btn_paths_adv = QPushButton("▶ 手动指定分步文件（可选）")
+        self.btn_paths_adv = QPushButton("手动指定分步文件（可选）")
         self.btn_paths_adv.setObjectName("ghost")
         self.btn_paths_adv.setCheckable(True)
         self.btn_paths_adv.toggled.connect(self._toggle_paths)
@@ -363,12 +461,12 @@ class MainWindow(QMainWindow):
 
         row_btns = QHBoxLayout()
         row_btns.setSpacing(8)
-        self.btn_run_all = QPushButton("▶ 开始扒谱")
+        self.btn_run_all = QPushButton("开始扒谱")
         self.btn_run_all.setObjectName("primary")
         self.btn_run_all.setMinimumHeight(38)
         self.btn_run_all.clicked.connect(self._run_all)
         row_btns.addWidget(self.btn_run_all)
-        self.btn_stop = QPushButton("⏹ 停止")
+        self.btn_stop = QPushButton("停止")
         self.btn_stop.setObjectName("danger")
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._stop)
@@ -400,8 +498,7 @@ class MainWindow(QMainWindow):
         return card
 
     def _build_pipeline_row(self) -> QFrame:
-        card = QFrame()
-        card.setObjectName("card")
+        card = self._make_card()
         outer = QVBoxLayout(card)
         outer.setContentsMargins(14, 10, 14, 12)
         outer.setSpacing(6)
@@ -444,7 +541,7 @@ class MainWindow(QMainWindow):
             setattr(self, exp, b_exp)
             br.addWidget(b_exp)
             bv.addLayout(br)
-            b_run = QPushButton("▶ 仅运行步骤 %s" % "①②③"[idx - 1])
+            b_run = QPushButton("仅运行步骤 %s" % "①②③"[idx - 1])
             b_run.setMinimumHeight(36)
             b_run.clicked.connect(lambda _=False, i=idx: self._run_step(i))
             setattr(self, run, b_run)
@@ -455,8 +552,8 @@ class MainWindow(QMainWindow):
 
     def _toggle_paths(self, on: bool) -> None:
         self.paths_box.setVisible(bool(on))
-        self.btn_paths_adv.setText("▼ 手动指定分步文件（可选）" if on
-                                   else "▶ 手动指定分步文件（可选）")
+        self.btn_paths_adv.setText("收起分步文件（可选）" if on
+                                   else "手动指定分步文件（可选）")
 
     def _sync_out_dirs(self, text: str) -> None:
         if hasattr(self, "s2_out"):
@@ -490,8 +587,7 @@ class MainWindow(QMainWindow):
 
 
     def _build_log(self) -> QFrame:
-        frame = QFrame()
-        frame.setObjectName("card")
+        frame = self._make_card()
         lay = QVBoxLayout(frame)
         lay.setContentsMargins(14, 10, 14, 12)
         lay.setSpacing(6)
@@ -568,7 +664,9 @@ class MainWindow(QMainWindow):
         else:
             self.device_state.setText("当前可用：CPU（速度较慢）")
         if info.get("ai_ready") is False:
-            self.device_state.setText("未安装 AI 扒谱模型（点右上角「环境与显卡体检」一键安装）")
+            self.device_state.setText("未安装 AI 扒谱模型（点左侧「环境与显卡体检」一键安装）")
+        if hasattr(self, "hero_dev_pill"):
+            self.hero_dev_pill.setText(self.device_state.text().replace("当前可用：", ""))
         if info.get("error"):
             self.log(f"设备探测提示：{info['error']}")
 
@@ -587,7 +685,28 @@ class MainWindow(QMainWindow):
                 w.setEnabled(not running)
             except Exception:
                 pass
+        for btn, _lo, _hi in getattr(self, "_range_presets", ()):
+            try:
+                btn.setEnabled(not running)
+            except Exception:
+                pass
         self.btn_stop.setEnabled(running)
+
+    def _apply_range_preset(self, low: int, high: int) -> None:
+        self.s3_low.blockSignals(True)
+        self.s3_high.blockSignals(True)
+        self.s3_low.setValue(int(low))
+        self.s3_high.setValue(int(high))
+        self.s3_low.blockSignals(False)
+        self.s3_high.blockSignals(False)
+        self._sync_range_presets()
+
+    def _sync_range_presets(self) -> None:
+        lo, hi = self.s3_low.value(), self.s3_high.value()
+        for btn, p_lo, p_hi in getattr(self, "_range_presets", ()):
+            btn.blockSignals(True)
+            btn.setChecked(lo == p_lo and hi == p_hi)
+            btn.blockSignals(False)
 
     def _update_transcribe_bar(self, pct: int, text: str) -> None:
         if hasattr(self, "transcribe_bar"):
@@ -724,14 +843,15 @@ class MainWindow(QMainWindow):
         self._update_transcribe_bar(self._run_stage_pct,
                                     f"✖ {label}未完成（已用时 {elapsed:.1f}s）· 请查看下方日志")
         self.log(f"× {label} 失败：{message}")
+        first_line = next((ln for ln in (message or "").splitlines() if ln.strip()), "未知错误")
         QMessageBox.warning(self, "运行失败",
-                            f"{label} 失败：\n\n{message.splitlines()[0]}")
+                            f"{label} 失败：\n\n{first_line}")
 
     def _stop(self) -> None:
         if pipeline.cancel_current():
-            self.log("⏹ 已请求停止当前子进程…")
+            self.log("× 已请求停止当前子进程…")
         else:
-            self.log("⏹ 已请求停止（等待当前任务结束）。")
+            self.log("× 已请求停止（等待当前任务结束）。")
 
     # ------------------------------------------------------------- settings
     def _load_settings(self) -> None:
@@ -756,6 +876,7 @@ class MainWindow(QMainWindow):
         self.s3_name.setText(str(s3.get("name") or ""))
         self.s3_low.setValue(int(s3.get("low") or 40))
         self.s3_high.setValue(int(s3.get("high") or 88))
+        self._sync_range_presets()
         try:
             _ver = int(data.get("version") or 0)
         except Exception:  # noqa: BLE001
@@ -1121,8 +1242,26 @@ class MainWindow(QMainWindow):
                          self.s2_out.text() if step == 2 else
                          self.s3_out.text())
         if d:
-            names = (("melody_vocal.mid", "melody_instrumental.mid") if step == 1 else
-                     ("main_melody.mid",) if step == 2 else ("final.mid",))
+            if step == 1:
+                names = ("melody_vocal.mid", "melody_instrumental.mid")
+            elif step == 2:
+                names = ("main_melody.mid",)
+            else:
+                extra_names = []
+                custom_name = self.s3_name.text().strip()
+                audio_txt = self.s1_audio.text().strip()
+                base = Path(custom_name).stem if custom_name else (Path(audio_txt).stem if audio_txt else "")
+                if base:
+                    stems = self._stems()
+                    if stems == "vocal":
+                        extra_names.append("人声轨-%s.mid" % base)
+                    elif stems == "inst":
+                        extra_names.append("乐器轨-%s.mid" % base)
+                    if custom_name:
+                        extra_names.append(custom_name if custom_name.lower().endswith((".mid", ".midi")) else (custom_name + ".mid"))
+                    extra_names.append("%s.mid" % base)
+                extra_names.append("final.mid")
+                names = tuple(dict.fromkeys(extra_names))
             cands += [os.path.join(str(d), n) for n in names]
         for c in cands:
             if c and os.path.isfile(str(c)):

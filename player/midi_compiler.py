@@ -430,7 +430,9 @@ def compile_fret(frames, timing=None, beam_width=BEAM_WIDTH, strum_chords=False,
                     rel = e["t"] + (e.get("hold") or 0.0)
                     if rel > new_busy[e["string"]]:
                         new_busy[e["string"]] = rel
-                nxt.append((cost + add, cand["groups"][-1]["fret"],
+                last_fret = (cand["groups"][-1]["fret"]
+                             if cand.get("groups") else prev_fret)
+                nxt.append((cost + add, last_fret,
                             tuple(new_busy), evs + batch))
         if not nxt:
             nxt = [(cost, prev_fret, busy, evs) for (cost, prev_fret, busy, evs) in beams]
@@ -1103,44 +1105,9 @@ def _interlock(hw, t):
 
 
 def reschedule_for_speed(timeline, speed=1.0):
-    """倍速播放重排：只缩放音符/帧间隔，保持机械按键按住与翻页等待时长为恒定物理毫秒。"""
-    spd = float(speed or 1.0)
-    if abs(spd - 1.0) <= 1e-4 or not timeline:
-        return timeline
-    out = dict(timeline)
-    evs = [dict(e) for e in (timeline.get("events") or [])]
-    if not evs:
-        return out
-    t_cfg = Timing()
-    min_key_hold = t_cfg.key_hold()
-    min_page_hold = t_cfg.page_key_hold()
-    min_click_hold = t_cfg.click_hold(timeline.get("kind"))
-    for e in evs:
-        e["t"] = round(float(e["t"]) / spd, 6)
-    # 恢复因除以 speed 而被压缩的按下->松开脉冲宽度
-    open_downs = {}
-    for e in evs:
-        op = e.get("op")
-        if op == "key_down":
-            open_downs[("k", e.get("key"))] = float(e["t"])
-        elif op == "key_up":
-            k = ("k", e.get("key"))
-            if k in open_downs:
-                dt = open_downs.pop(k)
-                floor = min_page_hold if e.get("key") in ("T", "R", "Z") else min_key_hold
-                if float(e["t"]) - dt < floor:
-                    e["t"] = round(dt + floor, 6)
-        elif op == "mouse_down":
-            open_downs[("m", e.get("btn"))] = float(e["t"])
-        elif op == "mouse_up":
-            k = ("m", e.get("btn"))
-            if k in open_downs:
-                dt = open_downs.pop(k)
-                if float(e["t"]) - dt < min_click_hold:
-                    e["t"] = round(dt + min_click_hold, 6)
-    evs.sort(key=lambda e: (e["t"], _op_order(e["op"])))
-    out["events"] = evs
-    return out
+    """倍速播放重排：直接委托 timeline_runner.reschedule_for_speed，统一机械保持与修饰键包络保护。"""
+    import timeline_runner as _TR
+    return _TR.reschedule_for_speed(timeline, speed)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1479,17 +1446,32 @@ def _compile_notes_timeline(song, path, role, notes, markers, t, *, start_offset
 def compile_custom_role(song_or_path, role, custom_notes, timing=None, chord_slices=None,
                         log=None, start_offset=None, onbeat_rule="highest",
                         enable_arpeggio=None, enable_chord_rhythm=None,
-                        chord_strum_mode=None, mode_markers=None):
+                        chord_strum_mode=None, mode_markers=None,
+                        instrument_mode="guitar_wheel", transpose=0):
     """钢琴卷帘直通重编：跳过 `adapt_song` 的自动重生成，直接编译用户改过的音符。"""
     log = log or (lambda m: None)
     t = timing or Timing()
     if start_offset is None:
         start_offset = float(t.p21)
+    if instrument_mode in ("guitar_36", "piano_36"):
+        import keyboard_layout as KL
+        if isinstance(song_or_path, (str, bytes, os.PathLike)):
+            path = os.fspath(song_or_path)
+        else:
+            path = (song_or_path or {}).get("path") or ""
+        return KL.compile_keyboard_song(
+            path, instrument_mode, timing=t, track_scope="all",
+            transpose=transpose, custom_notes=custom_notes,
+            start_offset=start_offset, log=log, detail=True,
+        )
     if isinstance(song_or_path, (str, bytes, os.PathLike)):
-        path = os.fspath(song_or_path)
-        song = load_song(path, enable_arpeggio=enable_arpeggio,
-                         enable_chord_rhythm=enable_chord_rhythm, timing=t,
-                         chord_strum_mode=chord_strum_mode)
+        path = os.fspath(song_or_path) if song_or_path else ""
+        if path and os.path.isfile(path):
+            song = load_song(path, enable_arpeggio=enable_arpeggio,
+                             enable_chord_rhythm=enable_chord_rhythm, timing=t,
+                             chord_strum_mode=chord_strum_mode)
+        else:
+            song = {}
     else:
         song = song_or_path or {}
         path = song.get("path") or ""
@@ -1559,12 +1541,31 @@ def compile_custom_role(song_or_path, role, custom_notes, timing=None, chord_sli
 def compile_file(path, role=ROLE_SOLO, timing=None, onbeat_rule="highest",
                  log=None, start_offset=None, enable_arpeggio=None, arpeggio_pattern=None,
                  enable_chord_rhythm=None, detail=False, want_analysis=False,
-                 chord_strum_mode=None, max_prune_ratio=0.0):
+                 chord_strum_mode=None, max_prune_ratio=0.0,
+                 instrument_mode="guitar_wheel", kb_track_scope="all", transpose=0,
+                 kb_arrange_mode="raw", kb_auto_accomp=True, kb_enable_arpeggio=True,
+                 kb_enable_chord_rhythm=True, kb_strum_roll=False, kb_arp_pattern="ascending",
+                 kb_solo_arpeggio=None, kb_p2_arpeggio=None):
     """编译一首 .mid（返回可以直接 json.dump 的 dict）。"""
     log = log or (lambda m: None)
     t = timing or Timing()
     if start_offset is None:
         start_offset = float(t.p21)
+    if instrument_mode in ("guitar_36", "piano_36"):
+        import keyboard_layout as KL
+        return KL.compile_keyboard_song(
+            path, instrument_mode, timing=t, track_scope=kb_track_scope,
+            transpose=transpose, custom_notes=None,
+            start_offset=start_offset, log=log, detail=detail,
+            arrange_mode=kb_arrange_mode,
+            enable_auto_accomp=kb_auto_accomp,
+            enable_arpeggio=kb_enable_arpeggio,
+            enable_chord_rhythm=kb_enable_chord_rhythm,
+            strum_roll=kb_strum_roll,
+            arp_pattern=kb_arp_pattern,
+            solo_arpeggio=kb_solo_arpeggio,
+            p2_arpeggio=kb_p2_arpeggio,
+        )
     song = load_song(path, enable_arpeggio=enable_arpeggio,
                      arpeggio_pattern=arpeggio_pattern,
                      enable_chord_rhythm=enable_chord_rhythm, timing=t,
@@ -1659,7 +1660,11 @@ def compile_file(path, role=ROLE_SOLO, timing=None, onbeat_rule="highest",
     return tl
 
 
-def deduce_song_timing(path, role=ROLE_SOLO, max_prune_ratio=None, timing=None):
+def deduce_song_timing(path, role=ROLE_SOLO, max_prune_ratio=None, timing=None,
+                       instrument_mode="guitar_wheel", kb_track_scope="all", transpose=0,
+                       kb_arrange_mode="raw", kb_auto_accomp=True, kb_enable_arpeggio=True,
+                       kb_enable_chord_rhythm=True, kb_strum_roll=False, kb_arp_pattern="ascending",
+                       kb_solo_arpeggio=None, kb_p2_arpeggio=None):
     """从 33ms 向 11ms 试编译，取第一个 late=0 的最大帧长。"""
     prune = 0.0 if max_prune_ratio is None else max(0.0, min(0.15, float(max_prune_ratio)))
     best = None
@@ -1667,7 +1672,18 @@ def deduce_song_timing(path, role=ROLE_SOLO, max_prune_ratio=None, timing=None):
     for frame in (33, 28, 24, 20, 16, 14, 11):
         cand = Timing(player_config.build_timing_for_frame_ms(frame))
         try:
-            tl = compile_file(path, role=role, timing=cand, max_prune_ratio=prune)
+            tl = compile_file(path, role=role, timing=cand, max_prune_ratio=prune,
+                              instrument_mode=instrument_mode,
+                              kb_track_scope=kb_track_scope,
+                              transpose=transpose,
+                              kb_arrange_mode=kb_arrange_mode,
+                              kb_auto_accomp=kb_auto_accomp,
+                              kb_enable_arpeggio=kb_enable_arpeggio,
+                              kb_enable_chord_rhythm=kb_enable_chord_rhythm,
+                              kb_strum_roll=kb_strum_roll,
+                              kb_arp_pattern=kb_arp_pattern,
+                              kb_solo_arpeggio=kb_solo_arpeggio,
+                              kb_p2_arpeggio=kb_p2_arpeggio)
             late = int((tl.get("stats") or {}).get("late") or 0)
         except Exception:
             continue
@@ -1716,6 +1732,23 @@ def report_text(tl):
     st = tl.get("stats") or {}
     cs = tl.get("compile_stats") or {}
     hw = tl.get("hw_stats") or {}
+    if tl.get("instrument_mode") in ("guitar_36", "piano_36"):
+        ri = tl.get("range_info") or {}
+        lines = ["乐器：%s（音域 %s~%s，移调 %+d）"
+                 % (tl.get("role_cn"), ri.get("low", "-"), ri.get("high", "-"),
+                    int(tl.get("transpose") or 0))]
+        lines.append("音符 %d / %d 帧 发声 %d 折叠 %d 丢弃 %d 覆盖率 %.1f%%"
+                     % (st.get("notes", 0), st.get("frames", 0), st.get("voices", 0),
+                        st.get("folded", 0), st.get("dropped", 0),
+                        float(ri.get("coverage") or 0.0) * 100.0))
+        lines.append("硬件动作 %d 条：按键 %d 次，修饰切换 %d 次，同帧拆批 %d 次"
+                     % (hw.get("hw_events", 0), hw.get("plucks", 0),
+                        hw.get("switches", 0), hw.get("batches_split", 0)))
+        if hw.get("late"):
+            lines.append("⚠ 有 %d 个音为满足按键间隔被迫晚了（最多 %.0f 毫秒）"
+                         % (hw["late"], (hw.get("max_late") or 0) * 1000))
+        lines.append("总时长 %.1f 秒" % (hw.get("duration", 0.0)))
+        return "\n".join(lines)
     lines = []
     for line in midi_adapter.report_lines(tl.get("adapter")):
         lines.append(line)

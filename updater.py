@@ -7,27 +7,37 @@
 from __future__ import annotations
 
 import ast
+import concurrent.futures
 import hashlib
 import json
 import os
 import re
 import shutil
 import sys
+import threading
 import time
 import urllib.request
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.insert(0, _SELF_DIR)
+
+from core_utils import ROOT as _CORE_ROOT, get_logger, sha256_file  # noqa: E402
+
+ROOT = str(_CORE_ROOT)
 VERSION_FILE = os.path.join(ROOT, "version.json")
 STAGING_DIR = os.path.join(ROOT, ".update_staging")
 BACKUP_DIR = os.path.join(ROOT, "logs", "backup_prev")
 BACKUP_INDEX = os.path.join(BACKUP_DIR, "backup.json")
 
-# 多镜像：按顺序探测，单源超时自动换下一个。
-# 前两个是国内加速镜像，最后一个是官方源（镜像全挂时兜底）。
+# 多镜像：并发竞速探测，最先返回合法清单的源胜出；单个源超时即放弃。
+# 前四项是实测可用的国内加速镜像，最后一项是官方源兜底。
 SOURCE_TIMEOUT = 4.0
 SOURCES = (
-    "https://ghfast.top/https://raw.githubusercontent.com/CiaLion/NTE-GuitarFlow/main/",
-    "https://mirror.ghproxy.com/https://raw.githubusercontent.com/CiaLion/NTE-GuitarFlow/main/",
+    "https://edgeone.gh-proxy.org/https://raw.githubusercontent.com/CiaLion/NTE-GuitarFlow/main/",
+    "https://hk.gh-proxy.org/https://raw.githubusercontent.com/CiaLion/NTE-GuitarFlow/main/",
+    "https://gh-proxy.com/https://raw.githubusercontent.com/CiaLion/NTE-GuitarFlow/main/",
+    "https://gh-proxy.org/https://raw.githubusercontent.com/CiaLion/NTE-GuitarFlow/main/",
     "https://raw.githubusercontent.com/CiaLion/NTE-GuitarFlow/main/",
 )
 
@@ -53,14 +63,6 @@ class UpdateError(Exception):
 
 def sha256_bytes(data):
     return hashlib.sha256(data).hexdigest()
-
-
-def sha256_file(path):
-    try:
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-    except Exception:
-        return ""
 
 
 def safe_rel(rel):
@@ -102,7 +104,8 @@ def load_local_manifest():
         with open(VERSION_FILE, "r", encoding="utf-8-sig") as f:
             man = json.load(f)
         return man if isinstance(man, dict) else {}
-    except Exception:
+    except Exception as exc:
+        get_logger("updater").debug("load_local_manifest failed: %s", exc)
         return {}
 
 
@@ -110,7 +113,7 @@ def _http_get(url, timeout=SOURCE_TIMEOUT):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "NTE-GuitarFlow-Updater/1.2",
+            "User-Agent": "NTE-GuitarFlow-Updater/1.4",
             "Cache-Control": "no-cache",
             "Accept": "*/*",
         },
@@ -131,30 +134,64 @@ def _norm_files(man):
 
 
 def fetch_remote_manifest(sources=None, timeout=SOURCE_TIMEOUT, log=None):
-    """按顺序探测镜像，返回 ``(manifest, base_url, errors)``。
+    """并发竞速探测所有更新源，返回 ``(manifest, base_url, errors)``。
 
-    全部失败时抛 ``UpdateError``，message 里带每个镜像的失败原因，方便排查。
+    首个返回合法 version.json 的源立即胜出（不阻塞等待其余慢源）；
+    全部失败时抛 ``UpdateError``，message 里汇总每个源的失败原因。
     """
-    errors = []
+    candidates = []
     for base in (sources or SOURCES):
-        if not base.endswith("/"):
-            base += "/"
-        try:
-            raw = _http_get(base + "version.json", timeout)
-            man = json.loads(raw.decode("utf-8-sig"))
-            if not isinstance(man, dict) or not isinstance(man.get("files"), dict):
-                raise ValueError("version.json 不是预期格式（缺 files）")
-            if log:
-                log("已连接镜像：%s" % base)
-            return man, base, errors
-        except Exception as exc:  # noqa: BLE001
-            errors.append("%s → %s" % (base, exc))
-            if log:
-                log("镜像不可用：%s（%s）" % (base, exc))
+        b = str(base or "").strip()
+        if not b:
+            continue
+        if not b.endswith("/"):
+            b += "/"
+        candidates.append(b)
+    if not candidates:
+        raise UpdateError("没有配置任何更新源。")
+
+    log_lock = threading.Lock()
+    done_flag = threading.Event()
+
+    def _say(msg):
+        if not log or done_flag.is_set():
+            return
+        with log_lock:
+            if not done_flag.is_set():
+                try:
+                    log(msg)
+                except Exception:
+                    pass
+
+    def _probe_one(base):
+        raw = _http_get(base + "version.json", timeout)
+        man = json.loads(raw.decode("utf-8-sig"))
+        if not isinstance(man, dict) or not isinstance(man.get("files"), dict):
+            raise ValueError("version.json 不是预期格式（缺 files）")
+        return man, base
+
+    errors = []
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(candidates))
+    try:
+        fut_map = {pool.submit(_probe_one, base): base for base in candidates}
+        for fut in concurrent.futures.as_completed(fut_map):
+            base = fut_map[fut]
+            try:
+                man, win_base = fut.result()
+                _say("已连接镜像：%s" % win_base)
+                done_flag.set()
+                return man, win_base, errors
+            except Exception as exc:  # noqa: BLE001
+                errors.append("%s → %s" % (base, exc))
+                _say("镜像不可用：%s（%s）" % (base, exc))
+    finally:
+        done_flag.set()
+        pool.shutdown(wait=False, cancel_futures=True)
+
     if errors and all("404" in e for e in errors):
         raise UpdateError(
             "远端仓库里还没有 version.json —— 可能还没把新版本推上 GitHub。\n"
-            "（三个镜像都返回 404）\n" + "\n".join(errors))
+            "（全部 %d 个更新源均返回 404）\n" % len(errors) + "\n".join(errors))
     raise UpdateError("所有更新源都没能取到清单：\n" + "\n".join(errors))
 
 
@@ -289,9 +326,9 @@ def download_update(info, timeout=None, log=None, progress=None):
 
 
 def _write_manifest(man):
-    """把远端清单写成新的本地 version.json（原子替换）。"""
+    """把远端清单写成新的本地 version.json（原子替换，保持纯 CRLF）。"""
     tmp = VERSION_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    with open(tmp, "w", encoding="utf-8", newline="\r\n") as f:
         json.dump(man, f, ensure_ascii=False, indent=2)
         f.write("\n")
     os.replace(tmp, VERSION_FILE)
@@ -306,13 +343,30 @@ def apply_update(info, staged, log=None, progress=None):
     if not staged:
         raise UpdateError("没有已校验的待更新文件")
 
+    for rel in staged:
+        nrel = safe_rel(rel)
+        if not nrel or nrel != rel or is_protected(rel):
+            raise UpdateError("拒绝替换受保护或非法路径：%s" % rel)
+        src = os.path.join(STAGING_DIR, rel.replace("/", os.sep))
+        if not os.path.isfile(src):
+            raise UpdateError("暂存文件不见了：%s（请重新检查更新）" % rel)
+
+    if os.path.isdir(BACKUP_DIR):
+        shutil.rmtree(BACKUP_DIR, ignore_errors=True)
     os.makedirs(BACKUP_DIR, exist_ok=True)
     index = {
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "from_version": str(info.get("local_version") or ""),
         "to_version": str(info.get("remote_version") or ""),
+        "had_prev_manifest": os.path.isfile(VERSION_FILE),
+        "prev_manifest": "__prev_version.json" if os.path.isfile(VERSION_FILE) else None,
         "files": {},
     }
+    if index["prev_manifest"]:
+        try:
+            shutil.copy2(VERSION_FILE, os.path.join(BACKUP_DIR, index["prev_manifest"]))
+        except Exception as exc:  # noqa: BLE001
+            raise UpdateError("备份 version.json 失败：%s" % exc)
 
     # ① 先把旧文件整体备份（含 SHA，回退时能核对）
     for rel in staged:
@@ -426,6 +480,27 @@ def rollback_update(log=None):
                 log("已回退 %s" % rel)
         except Exception as exc:  # noqa: BLE001
             missing.append("%s（%s）" % (rel, exc))
+
+    prev_man = index.get("prev_manifest")
+    if prev_man:
+        prev_src = os.path.join(BACKUP_DIR, prev_man)
+        if os.path.isfile(prev_src):
+            try:
+                tmp_ver = VERSION_FILE + ".tmp"
+                shutil.copy2(prev_src, tmp_ver)
+                os.replace(tmp_ver, VERSION_FILE)
+                if log:
+                    log("已回退 version.json")
+            except Exception as exc:  # noqa: BLE001
+                missing.append("version.json（%s）" % exc)
+        else:
+            missing.append("version.json")
+    elif index.get("had_prev_manifest") is False:
+        try:
+            if os.path.isfile(VERSION_FILE):
+                os.remove(VERSION_FILE)
+        except Exception:
+            pass
 
     clean_pycache()
     return {

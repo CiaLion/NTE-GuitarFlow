@@ -26,6 +26,16 @@ DEFAULTS = {
     "wheel_radius_ratio": 0.2957,
     "speed": 1.0,
     "mode": "fret",          # 只有 "fret"（品格）和 "chord"（和弦）
+    "instrument_mode": "guitar_wheel",
+    "kb_track_scope": "all",
+    "kb_arrange_mode": "raw",
+    "kb_auto_accomp": True,
+    "kb_enable_arpeggio": True,
+    "kb_solo_arpeggio": True,
+    "kb_p2_arpeggio": True,
+    "kb_enable_chord_rhythm": True,
+    "kb_strum_roll": False,
+    "kb_arp_pattern": "ascending",
     "transpose": 0,
     "enable_arpeggio": True, # 开启指弹横按琶音（伴奏与独奏空隙展开为流水琶音）
     # 2P 和弦伴奏是否按真实单拍做整拍扫弦律动（关 = 每个切片只扫 1 次）
@@ -33,6 +43,8 @@ DEFAULTS = {
     "enable_auto_accomp": True,
     "roll_volume": 35,       # 卷帘试听音量（0~100）
     "prune_ratio": 0,        # 允许删音百分比（0~15），0 = 不删
+    "guide_shown": False,    # 首次启动是否已看过使用指南
+    "midi_live": {},         # 实时 MIDI 键盘直弹配置
     "timing": {},            # 延迟参数（见 TIMING_INFO），空 = 全用默认
 }
 
@@ -397,16 +409,47 @@ def _write(data):
 # ══════════════════════════════════════════════════════════════════════════
 # 通用设置（老接口，签名没变）
 # ══════════════════════════════════════════════════════════════════════════
+_FIELD_BOUNDS = {
+    "wheel_x_ratio": (float, 0.05, 0.95),
+    "wheel_y_ratio": (float, 0.05, 0.95),
+    "wheel_radius_ratio": (float, 0.05, 0.48),
+    "speed": (float, 0.2, 3.0),
+    "transpose": (int, -24, 24),
+    "roll_volume": (int, 0, 100),
+    "prune_ratio": (int, 0, 15),
+}
+
+
+def _sanitize_field(key, value):
+    spec = _FIELD_BOUNDS.get(key)
+    if spec is None:
+        return value
+    typ, lo, hi = spec
+    dflt = DEFAULTS[key]
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return dflt
+    if v != v or v in (float("inf"), float("-inf")):
+        return dflt
+    v = max(float(lo), min(float(hi), v))
+    return int(round(v)) if typ is int else v
+
+
 def load():
     """Return the stored settings, falling back to defaults for anything missing."""
     data = dict(DEFAULTS)
+    data["midi_live"] = dict(DEFAULTS.get("midi_live") or {})
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             raw = json.load(f)
         if isinstance(raw, dict):
             for k in DEFAULTS:
                 if k in raw and k != "timing":
-                    data[k] = raw[k]
+                    if k == "midi_live":
+                        data[k] = dict(raw[k]) if isinstance(raw[k], dict) else {}
+                    else:
+                        data[k] = _sanitize_field(k, raw[k])
     except FileNotFoundError:
         pass
     except Exception:
@@ -420,7 +463,10 @@ def save(settings):
     data = load()
     for k in DEFAULTS:
         if k in settings:
-            data[k] = settings[k]
+            if k == "midi_live":
+                data[k] = dict(settings[k]) if isinstance(settings[k], dict) else {}
+            else:
+                data[k] = _sanitize_field(k, settings[k])
     # timing 单独合并（不能整块覆盖，否则界面只改一项会把其余项清掉）
     timing = data.get("timing") or {}
     got = expand_pluck_hold((settings or {}).get("timing"))

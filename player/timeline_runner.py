@@ -91,20 +91,32 @@ def wait_next_5s(stop_flag=None, log=None):
         # 最后 50 毫秒自旋，靠真实时间判定
     return time.perf_counter()
 
+_MODIFIER_KEYS = frozenset({"LShift", "LCtrl", "LSHIFT", "LCTRL", "Shift", "Ctrl", "SHIFT", "CTRL"})
+
+
 def reschedule_for_speed(timeline, speed, mechanical_max=0.06):
-    """按倍速缩放时间轴，但**不压缩**硬件按住时长。
+    """按倍速缩放时间轴，但**不压缩**硬件按住时长，并保护同键重按间隔与 LShift/LCtrl 修饰包络。
 
     直接 t/speed 会把 page_key_hold(28ms)、after_page_key_release(35ms)
     一起除以倍速，1.5x 下只剩 18ms，低于游戏帧采样就会吞键。
     这里只缩放“乐谱间隔”：按下→松开之间原本 <=60ms 的机械间隙（拨弦/翻页/
-    点击）保持恒定物理毫秒数；更长的时值（延音）按倍速正常压缩。
+    点击）与同物理键松开→重按的 repluck_gap 保持恒定物理毫秒数；更长的时值（延音）按倍速正常压缩。
     """
     speed = max(0.1, float(speed or 1.0))
     if abs(speed - 1.0) <= 1e-9:
         return dict(timeline or {})
+    t_cfg = (timeline or {}).get("timing") or {}
+    min_gap = max(0.001, float(t_cfg.get("p1") or t_cfg.get("min_action_interval") or 0.001))
+    repluck_gap = max(0.005, float(t_cfg.get("p20") or t_cfg.get("repluck_gap") or 0.005))
     src = list((timeline or {}).get("events") or [])
     out = []
     queues = {}
+    active_mods = {}
+    active_mod_downs = {}
+    last_mod_up = None
+    last_plain_up = None
+    last_key_up_orig = {}
+    last_key_up_out = {}
     last_t = 0.0
     for ev in src:
         item = dict(ev)
@@ -115,6 +127,22 @@ def reschedule_for_speed(timeline, speed, mechanical_max=0.06):
         if op in ("key_down", "mouse_down"):
             fam = "key" if op == "key_down" else "mouse"
             target = item.get("key") if fam == "key" else item.get("btn")
+            if fam == "key":
+                sk = str(target)
+                if sk in _MODIFIER_KEYS:
+                    if last_mod_up is not None:
+                        t = max(t, last_mod_up + min_gap)
+                    if last_plain_up is not None:
+                        t = max(t, last_plain_up + min_gap)
+                else:
+                    if active_mod_downs:
+                        t = max(t, max(active_mod_downs.values()) + min_gap)
+                    if last_mod_up is not None:
+                        t = max(t, last_mod_up + min_gap)
+                    if sk in last_key_up_out:
+                        orig_repress = orig - last_key_up_orig[sk]
+                        if orig_repress >= 0.0:
+                            t = max(t, last_key_up_out[sk] + min(orig_repress, repluck_gap))
         elif op in ("key_up", "mouse_up"):
             fam = "key" if op == "key_up" else "mouse"
             target = item.get("key") if fam == "key" else item.get("btn")
@@ -124,11 +152,29 @@ def reschedule_for_speed(timeline, speed, mechanical_max=0.06):
                 gap = orig - down_orig
                 if 0.0 < gap <= mechanical_max:
                     t = max(t, down_out + gap)
+            if fam == "key" and str(target) in _MODIFIER_KEYS and str(target) in active_mods:
+                t = max(t, active_mods[str(target)] + min_gap)
         item["t"] = round(max(t, last_t), 6)
         last_t = item["t"]
         if op in ("key_down", "mouse_down"):
             # 记录“真正发出”的时刻，供配对松开时保持机械间隔
             queues.setdefault((fam, target), []).append([orig, last_t])
+            if fam == "key" and str(target) in _MODIFIER_KEYS:
+                active_mods[str(target)] = last_t
+                active_mod_downs[str(target)] = last_t
+        elif op == "key_up":
+            sk = str(target)
+            if sk in _MODIFIER_KEYS:
+                active_mods.pop(sk, None)
+                active_mod_downs.pop(sk, None)
+                last_mod_up = last_t
+            else:
+                last_plain_up = last_t
+                last_key_up_orig[sk] = orig
+                last_key_up_out[sk] = last_t
+                for mk in active_mods:
+                    if last_t > active_mods[mk]:
+                        active_mods[mk] = last_t
         out.append(item)
     result = dict(timeline or {})
     result["events"] = out
@@ -157,6 +203,7 @@ class TimelineRunner(object):
         self._on_pause_state_changed = on_pause_state_changed
         self.stats = {}
         self.paused = False
+        self._state_lock = threading.RLock()
         self._held_keys = set()
         self._held_mouse = set()
 
@@ -165,42 +212,47 @@ class TimelineRunner(object):
 
     def _press_key(self, key):
         key = str(key)
-        if key.isdigit():
-            self.io.pluck_key_down(key)
-        else:
-            self.io.tap_key_down(key)
-        self._held_keys.add(key)
+        with self._state_lock:
+            if key.isdigit():
+                self.io.pluck_key_down(key)
+            else:
+                self.io.tap_key_down(key)
+            self._held_keys.add(key)
 
     def _release_key(self, key):
         key = str(key)
-        if key not in self._held_keys:
-            return
-        self._held_keys.discard(key)
-        try:
-            if key.isdigit():
-                self.io.pluck_key_up(key)
-            else:
-                self.io.tap_key_up(key)
-        except Exception:
-            pass
+        with self._state_lock:
+            if key not in self._held_keys:
+                return
+            self._held_keys.discard(key)
+            try:
+                if key.isdigit():
+                    self.io.pluck_key_up(key)
+                else:
+                    self.io.tap_key_up(key)
+            except Exception:
+                pass
 
     def _press_mouse(self, btn):
-        self.io.click_down(btn)
-        self._held_mouse.add(btn)
+        with self._state_lock:
+            self.io.click_down(btn)
+            self._held_mouse.add(btn)
 
     def _release_mouse(self, btn):
-        if btn not in self._held_mouse:
-            return
-        self._held_mouse.discard(btn)
-        try:
-            self.io.click_up(btn)
-        except Exception:
-            pass
+        with self._state_lock:
+            if btn not in self._held_mouse:
+                return
+            self._held_mouse.discard(btn)
+            try:
+                self.io.click_up(btn)
+            except Exception:
+                pass
 
     def pause(self, reason="手动暂停"):
         """立即松键并进入暂停（可被 F8 恢复）。"""
-        self.release_all(reason)
-        self.paused = True
+        with self._state_lock:
+            self.paused = True
+            self.release_all(reason)
         if self._on_focus_lost is not None:
             try:
                 self._on_focus_lost()
@@ -220,13 +272,15 @@ class TimelineRunner(object):
 
     def resume(self):
         """恢复播放前先检查前台：不在游戏里就拒绝，绝不抢焦点。"""
-        if self._is_game_foreground is not None:
+        fg_check = self._is_game_foreground or getattr(self, "_run_fg_func", None)
+        if fg_check is not None:
             try:
-                if not bool(self._is_game_foreground()):
+                if not bool(fg_check()):
                     return False
             except Exception:
                 return False
-        self.paused = False
+        with self._state_lock:
+            self.paused = False
         self._notify_pause(False, "继续")
         return True
 
@@ -244,12 +298,18 @@ class TimelineRunner(object):
         return False
 
     def release_all(self, reason=""):
-        """松开所有按住的键和鼠标键（停止/报错/结束都要调）。"""
-        n = len(self._held_keys) + len(self._held_mouse)
-        for k in list(self._held_keys):
-            self._release_key(k)
-        for b in list(self._held_mouse):
-            self._release_mouse(b)
+        """松开所有按住的键和鼠标键（停止/报错/结束都要调）。先松普通键，最后松 LShift/LCtrl。"""
+        with self._state_lock:
+            n = len(self._held_keys) + len(self._held_mouse)
+            held = list(self._held_keys)
+            for k in held:
+                if k not in _MODIFIER_KEYS:
+                    self._release_key(k)
+            for k in held:
+                if k in _MODIFIER_KEYS:
+                    self._release_key(k)
+            for b in list(self._held_mouse):
+                self._release_mouse(b)
         if n and reason:
             self.log("已松开 %d 个按住的通道（%s）" % (n, reason))
         return n
@@ -292,8 +352,7 @@ class TimelineRunner(object):
                     return self.io.foreground_window() == game_hwnd
                 except Exception:
                     return False
-        if fg_func is not None:
-            self._is_game_foreground = fg_func
+        self._run_fg_func = fg_func
 
         self._focus_lost_count = 0
         watch_stop = threading.Event()
@@ -309,10 +368,12 @@ class TimelineRunner(object):
                     self._focus_lost_count += 1
                     self.log("⚠️ 检测到切出游戏窗口，已自动释放全部按键并暂停"
                              "（切回游戏后按 F8 继续）")
-                time.sleep(FOCUS_CHECK_INTERVAL)
+                watch_stop.wait(FOCUS_CHECK_INTERVAL)
 
+        watch_thread = None
         if focus_guard and fg_func is not None:
-            threading.Thread(target=_watch_focus, daemon=True).start()
+            watch_thread = threading.Thread(target=_watch_focus, daemon=True)
+            watch_thread.start()
 
         self.stats = {"events": len(events), "late": 0, "max_late": 0.0,
                       "late_list": [], "elapsed": 0.0, "speed": speed,
@@ -322,10 +383,16 @@ class TimelineRunner(object):
         lost_focus = 0
         paused_total = 0.0
 
+        def _is_paused_now():
+            return bool((pause_flag is not None and pause_flag()) or self.paused)
+
         with WinTimer(1):
             if sync_start and not fast:
                 base = wait_next_5s(stop_flag, self.log)
                 if base is None:
+                    watch_stop.set()
+                    if watch_thread is not None and watch_thread.is_alive():
+                        watch_thread.join(timeout=0.5)
                     self.release_all("被停止")
                     return self.stats
             else:
@@ -336,19 +403,32 @@ class TimelineRunner(object):
                 while idx < len(events):
                     if stop_flag is not None and stop_flag():
                         break
-                    # 暂停：不吃时间
-                    if pause_flag is not None and pause_flag():
+                    # 暂停：不吃时间（同时响应外部 pause_flag 与内部 self.paused）
+                    if _is_paused_now():
                         p0 = time.perf_counter()
-                        while pause_flag() and not (stop_flag and stop_flag()):
+                        while _is_paused_now() and not (stop_flag and stop_flag()):
+                            # 若无外部暂停控制且焦点已回归，允许自动恢复以免孤立调用死锁
+                            if pause_flag is None and self._on_focus_lost is None and self.paused:
+                                try:
+                                    fg_ok = (fg_func is None or bool(fg_func()))
+                                except Exception:
+                                    fg_ok = False
+                                if fg_ok and not self._alt_or_win_down():
+                                    self.resume()
+                                    break
                             time.sleep(0.01)
-                        paused_total += time.perf_counter() - p0
-                        base += time.perf_counter() - p0
+                        delta_p = time.perf_counter() - p0
+                        paused_total += delta_p
+                        base += delta_p
+                        continue
 
                     ev = events[idx]
                     target = base + float(ev["t"]) / speed
                     if not fast:
-                        if not wait_until(target, stop_flag):
-                            break
+                        if not wait_until(target, lambda: (stop_flag and stop_flag()) or _is_paused_now()):
+                            if stop_flag is not None and stop_flag():
+                                break
+                            continue
 
                     now = time.perf_counter()
                     if now - target > 0.002:
@@ -359,18 +439,24 @@ class TimelineRunner(object):
                         if d > max_late:
                             max_late = d
 
-                    # 任何动作发出前最后一刻：Alt/Win 按住或已切出 → 当场不发
+                    # 任何动作发出前最后一刻：Alt/Win 按住或已切出 → 暂停并原地保留 idx 等待恢复
                     if focus_guard and (self._alt_or_win_down()
                                         or (fg_func is not None and not bool(fg_func()))):
                         self.pause("检测到 Alt/Win 或切出游戏")
                         lost_focus += 1
-                        idx += 1
                         continue
 
+                    paused_race = False
                     try:
-                        self._do(ev)
+                        with self._state_lock:
+                            if _is_paused_now():
+                                paused_race = True
+                            else:
+                                self._do(ev)
                     except Exception as exc:
                         self.log("动作失败（%s）：%s" % (ev.get("op"), exc))
+                    if paused_race:
+                        continue
 
                     idx += 1
                     if self._on_progress and (idx % 10 == 0 or idx == len(events)):
@@ -381,6 +467,9 @@ class TimelineRunner(object):
                             pass
             finally:
                 watch_stop.set()
+                if watch_thread is not None and watch_thread.is_alive():
+                    watch_thread.join(timeout=0.5)
+                self._run_fg_func = None
                 self.release_all("演奏结束")
 
         lost_focus += int(getattr(self, "_focus_lost_count", 0))

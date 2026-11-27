@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 from dataclasses import dataclass, field, replace
@@ -532,12 +533,40 @@ def load_tracks_json(path: Union[str, Path]) -> List[TrackNotes]:
 # ---------------------------------------------------------------------------
 # MIDI 读写
 # ---------------------------------------------------------------------------
+def _load_pretty_midi_safe(path: Path) -> pretty_midi.PrettyMIDI:
+    """读取 MIDI；若含 set_tempo(tempo<=0) 导致 pretty_midi 除零，先清洗为 120 BPM 再内存加载。"""
+    try:
+        return pretty_midi.PrettyMIDI(str(path))
+    except ZeroDivisionError:
+        mid = mido.MidiFile(str(path), clip=True)
+        for tr_idx, tr in enumerate(mid.tracks):
+            for msg_idx, msg in enumerate(tr):
+                if msg.type == "set_tempo" and int(getattr(msg, "tempo", 0) or 0) <= 0:
+                    tr[msg_idx] = msg.copy(tempo=500000)
+                elif getattr(msg, "is_meta", False):
+                    for attr in ("name", "text"):
+                        if hasattr(msg, attr):
+                            val = getattr(msg, attr)
+                            if isinstance(val, str):
+                                try:
+                                    val.encode("latin-1")
+                                except UnicodeEncodeError:
+                                    safe_val = val.encode("latin-1", "replace").decode("latin-1")
+                                    if attr == "name" and not safe_val.strip("?"):
+                                        safe_val = f"Track {tr_idx + 1}"
+                                    tr[msg_idx] = tr[msg_idx].copy(**{attr: safe_val})
+        buf = io.BytesIO()
+        mid.save(file=buf)
+        buf.seek(0)
+        return pretty_midi.PrettyMIDI(buf)
+
+
 def read_midi_tracks(path: Union[str, Path]) -> List[TrackNotes]:
     """用 pretty_midi 读取 MIDI，全部转成绝对秒；保留轨名与鼓轨标记。"""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"MIDI 不存在: {path}")
-    pm = pretty_midi.PrettyMIDI(str(path))
+    pm = _load_pretty_midi_safe(path)
     tracks: List[TrackNotes] = []
     for idx, inst in enumerate(pm.instruments):
         notes = [Note(n.pitch, n.start, n.end, n.velocity) for n in inst.notes]
@@ -577,6 +606,12 @@ def write_midi(
     """
     if tempo_bpm:
         bpm = tempo_bpm
+    try:
+        bpm = float(bpm)
+    except (TypeError, ValueError):
+        bpm = DEFAULT_BPM
+    if bpm <= 0.0:
+        bpm = DEFAULT_BPM
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 

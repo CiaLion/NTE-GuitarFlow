@@ -9,9 +9,11 @@
 * 内嵌和弦标记（Guitar Pro 导出的 marker / lyrics / text）—— 和弦模式的现成答案；
 * 每轨独立收集音符，供"自动挑主旋律轨"使用。
 """
+import bisect
 import os
 import re
-from collections import Counter
+import threading
+from collections import Counter, OrderedDict
 
 import mido
 
@@ -42,29 +44,36 @@ def build_time_converter(mid):
         for msg in track:
             tick += msg.time
             if msg.type == 'set_tempo':
-                changes.append((tick, msg.tempo))
+                tp_val = int(getattr(msg, 'tempo', 500000) or 0)
+                if tp_val <= 0:
+                    tp_val = 500000
+                changes.append((tick, tp_val))
     changes.sort()
     if not changes or changes[0][0] > 0:
         changes.insert(0, (0, 500000))       # 缺省 120 BPM
 
-    # 2) 预先算好每一段 tempo 的起点（tick, 秒），避免每条消息都从头积分
+    # 2) 预先算好每一段 tempo 的起点（tick, 秒），利用 bisect_right O(log N) 查表
     segs = []
+    starts = []
     sec = 0.0
     prev_tick = 0
     tempo = changes[0][1]
     for (t, tp) in changes:
         if t > prev_tick:
             segs.append((prev_tick, t, sec, tempo))
+            starts.append(prev_tick)
             sec += mido.tick2second(t - prev_tick, tpb, tempo)
             prev_tick = t
         tempo = tp
     segs.append((prev_tick, float('inf'), sec, tempo))
+    starts.append(prev_tick)
 
     def conv(tick):
-        for (a, b, s0, tp) in segs:
-            if a <= tick < b:
-                return s0 + mido.tick2second(tick - a, tpb, tp)
-        return sec
+        if tick < starts[0]:
+            return sec
+        idx = bisect.bisect_right(starts, tick) - 1
+        a, _b, s0, tp = segs[idx]
+        return s0 + mido.tick2second(tick - a, tpb, tp)
 
     return conv
 
@@ -120,14 +129,51 @@ class FlatNote(object):
         return "FlatNote(t=%.3f, %s, len=%.3f)" % (
             self.start, midi_note_to_name(self.pitch), self.length)
 
+_MIDI_CACHE = OrderedDict()
+_MIDI_CACHE_MAX = 32
+_MIDI_CACHE_LOCK = threading.Lock()
+
+
+def clear_midi_cache():
+    """清空 read_flat_notes 的 32 槽 LRU 缓存。"""
+    with _MIDI_CACHE_LOCK:
+        _MIDI_CACHE.clear()
+
+
+def _copy_flat_result(notes, meta):
+    notes_copy = [
+        FlatNote(n.start, n.pitch, n.velocity, n.length, n.channel, n.track_idx)
+        for n in notes
+    ]
+    meta_copy = dict(meta)
+    if "tempo_map" in meta_copy:
+        meta_copy["tempo_map"] = list(meta_copy["tempo_map"])
+    return notes_copy, meta_copy
+
+
 def read_flat_notes(path, drop_drums=True, tracks=None):
     """
     读成扁平音符表（**唯一的一份 MIDI 读取器**）。
 
     返回 (notes, meta)；notes 按开始时间排序，时间是**秒**。
     tracks: 只要这几条轨（轨号列表）；None = 全部。
-    全项目**只有这一份** MIDI 读取器。
+    带 32 槽 (abs_path, mtime_ns, size, drop_drums, tracks) LRU 缓存，命中返回隔离拷贝。
     """
+    abs_path = os.path.abspath(os.fspath(path))
+    tracks_key = tuple(tracks) if tracks is not None else None
+    try:
+        st = os.stat(abs_path)
+        cache_key = (abs_path, int(st.st_mtime_ns), int(st.st_size), bool(drop_drums), tracks_key)
+    except OSError:
+        cache_key = None
+
+    if cache_key is not None:
+        with _MIDI_CACHE_LOCK:
+            hit = _MIDI_CACHE.get(cache_key)
+            if hit is not None:
+                _MIDI_CACHE.move_to_end(cache_key)
+                return _copy_flat_result(hit[0], hit[1])
+
     mid = mido.MidiFile(path)
     conv = build_time_converter(mid)
     notes = []
@@ -142,7 +188,8 @@ def read_flat_notes(path, drop_drums=True, tracks=None):
         for msg in track:
             tick += msg.time
             if msg.type == 'set_tempo':
-                bpm_value = mido.tempo2bpm(msg.tempo)
+                tp_val = int(getattr(msg, 'tempo', 500000) or 0)
+                bpm_value = mido.tempo2bpm(tp_val if tp_val > 0 else 500000)
                 tempos.append(bpm_value)
                 tempo_events.append((round(conv(tick), 6), round(float(bpm_value), 4)))
                 continue
@@ -174,6 +221,13 @@ def read_flat_notes(path, drop_drums=True, tracks=None):
         "length": mid.length,
         "note_count": len(notes),
     }
+    if cache_key is not None:
+        stored_notes, stored_meta = _copy_flat_result(notes, meta)
+        with _MIDI_CACHE_LOCK:
+            _MIDI_CACHE[cache_key] = (stored_notes, stored_meta)
+            _MIDI_CACHE.move_to_end(cache_key)
+            while len(_MIDI_CACHE) > _MIDI_CACHE_MAX:
+                _MIDI_CACHE.popitem(last=False)
     return notes, meta
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -325,7 +379,8 @@ def detect_timing_problems(path, min_span=8.0, max_count=8, spread_ratio=0.2):
         for msg in track:
             tick += msg.time
             if msg.type == "set_tempo":
-                evs.append((round(conv(tick), 4), round(mido.tempo2bpm(msg.tempo), 2)))
+                tp_val = int(getattr(msg, "tempo", 500000) or 0)
+                evs.append((round(conv(tick), 4), round(mido.tempo2bpm(tp_val if tp_val > 0 else 500000), 2)))
     evs.sort()
     if len(evs) <= 1:
         return []
@@ -481,7 +536,8 @@ class MidiSong(object):
         for track in mid.tracks:
             for msg in track:
                 if msg.type == 'set_tempo':
-                    self.bpm = round(mido.tempo2bpm(msg.tempo), 1)
+                    tp_val = int(getattr(msg, 'tempo', 500000) or 0)
+                    self.bpm = round(mido.tempo2bpm(tp_val if tp_val > 0 else 500000), 1)
                     break
 
         try:
